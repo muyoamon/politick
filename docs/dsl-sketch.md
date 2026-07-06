@@ -233,3 +233,98 @@ which diffs the meta rules let through.
    ambiguous natural-language clause into a DSL patch, recorded as precedent
    (a new rule with provenance `court`). Stare decisis = precedent rules
    outrank fresh interpretation.
+
+Items 1–3 are resolved in §8. Courts (item 4) remains open.
+
+---
+
+## 8. Resolved decisions
+
+1. **Procedure pinning: re-resolve per step** (kernel invariant). No
+   start-of-flight snapshot — simpler (no snapshot plumbing), and it makes
+   mid-passage rule changes a real political tactic. If a step re-resolves
+   and its procedure no longer exists, the instance aborts (§9).
+2. **Conflict semantics: priority, then provenance timestamp**, as sketched
+   in §4. Promoting priority to legislatable data (lex specialis / lex
+   posterior as meta rules) is deferred — not v1.
+3. **Typed DSL: yes.** A small static type system over facts/derives; diffs
+   are type- and reference-checked at staging time. A rejection carries a
+   structured error message so the authoring persona can retry the compile.
+
+---
+
+## 9. Schema migration
+
+Principle: the kernel deterministically handles orphaned **data**; dangling
+**references** are validation failures.
+
+- **Validation**: a diff that removes a schema (or rule/derive/procedure)
+  still referenced by surviving terms is rejected at staging, with the
+  dependency list. Revolutionary diffs must carry their full closure — the
+  rejection message tells the persona exactly what its bill must include.
+- **Apply cascade**: for each removed schema, in canonical (interned-symbol)
+  order: drop all facts of that schema and emit a kernel event
+  `facts_dropped(schema, count)`, delivered next tick. Offices vanishing and
+  actors losing capabilities fall out for free — caps are facts.
+- **Schema change = remove + add.** A retyped or re-fielded schema drops all
+  old facts by default. Continuity (e.g. renaming an office without vacating
+  it) requires an explicit `migrate` mapping in the diff — the author's job,
+  never a kernel default.
+- **Mid-flight procedures**: removing a procedure with instances in flight
+  aborts those instances and emits a kernel event (interacts with re-resolve
+  per step: the next step re-resolves, finds nothing, aborts).
+- **Invariant**: validation is where diffs get rejected; **apply is total and
+  never fails**. Once a diff passes the reference check and its meta rules,
+  the cascade always succeeds deterministically — COMMIT stays atomic with no
+  rollback machinery.
+
+---
+
+## 10. Failure semantics & totality
+
+- The expression language inside `do:` bodies is total: comprehensions over
+  finite fact sets only, no unbounded recursion or loops, with a fuel/step
+  limit as backstop. LLM-authored law cannot hang the tick.
+- If a rule's action errors mid-tick, all of that rule's queued actions are
+  dropped atomically and a kernel event is emitted. Partial application of a
+  single rule's actions is never observable.
+
+---
+
+## 11. Implementation plan
+
+- **Kernel in Zig**, as a pure log-processor binary: event/diff log in,
+  state + new log entries out. No HTTP, no LLM calls, no async inside the
+  kernel. Persona/LLM orchestration is a separate driver process (any
+  convenient language) speaking to the kernel only through the log.
+- **Event-sourced**: the append-only event/diff log is the source of truth;
+  world state and the rule DB are folds over it. Rule DB versions via
+  copy-on-write at commit; old versions rematerializable by replay, so no
+  persistent data structures needed. Replay must reproduce identical
+  per-tick state hashes — that's the standing determinism test.
+- **IR-first, syntax later**: the DSL is a typed intermediate representation
+  with a serialization (JSON) and schema. Personas compile bills via
+  constrained decoding against the IR schema — no parsing of surface syntax.
+  The surface syntax in this document is a display/authoring layer, added
+  later. The IR schema and log format are the stable contracts; the kernel
+  implementation stays rewritable behind them.
+- **Naive evaluation first**: full derive recompute per tick. Keep derives
+  pure so salsa-style memoization (§6) can drop in later; the only day-one
+  index is rules-by-event-type.
+- **Determinism in Zig**: `std.ArrayHashMap` (insertion-order iteration) or
+  sorted keys — never unordered map iteration; a seeded PRNG threaded
+  explicitly through the tick; no wall clock in the kernel.
+- **Memory model**: arena per tick for transients (queued actions, staged
+  scratch), reset at the tick boundary; a global interned symbol table
+  (comparison = pointer equality); a `Value` tagged union for runtime fact
+  values, since fact schemas are runtime data — comptime-derived
+  serialization/validation covers the IR term structure only.
+- **Build order** (vertical slices):
+  1. Kernel + facts + rules, hardcoded toy scenario (poll tax, approval);
+     determinism and replay tests from day one.
+  2. Diffs + meta — the commit check is the heart; property-test it against
+     adversarial diffs (L0-targeting, capability escalation, diffs weakening
+     their own governing meta rule).
+  3. Procedures, as sugar over facts + rules.
+  4. LLM actors last; scripted/random actors until then, so kernel bugs and
+     persona bugs stay distinguishable.
