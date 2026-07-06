@@ -78,6 +78,9 @@ pub fn main(init: std.process.Init) !void {
     };
     try politick.log.checkHeader(arena, header_line);
 
+    var world = try politick.tick.World.init(arena, config.seed);
+    var decoder = politick.ir.Decoder.init(world.irAllocator(), arena, &world.interner);
+
     var entry_count: u64 = 0;
     while (it.next()) |line| {
         if (line.len == 0) continue;
@@ -85,7 +88,24 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("error: malformed log entry: {s}\n", .{line});
             std.process.exit(1);
         };
-        entry.deinit(arena);
+        defer entry.deinit(arena);
+        switch (entry.envelope.kind) {
+            .diff => {
+                const ops = decoder.decodePayload(entry.payload) catch {
+                    std.debug.print("error: bad IR in log entry seq {d}\n", .{entry.envelope.seq});
+                    std.process.exit(1);
+                };
+                world.applyGenesis(ops) catch |err| {
+                    std.debug.print("error: genesis apply failed at seq {d}: {t}\n", .{ entry.envelope.seq, err });
+                    std.process.exit(1);
+                };
+            },
+            // External events arrive with the persona driver (M4).
+            .event => {
+                std.debug.print("error: event entries are not supported yet (seq {d})\n", .{entry.envelope.seq});
+                std.process.exit(1);
+            },
+        }
         entry_count += 1;
     }
 
@@ -94,8 +114,6 @@ pub fn main(init: std.process.Init) !void {
     const stdout = &stdout_file_writer.interface;
 
     try stdout.print("log {s}: format ok, {d} entries\n", .{ config.log_path, entry_count });
-
-    var world = politick.tick.World.init(arena, config.seed);
     var last: politick.hash.Digest = world.chain;
     for (0..config.ticks) |_| {
         last = try world.step();
