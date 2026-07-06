@@ -21,6 +21,7 @@ pub const EvalError = error{
     UnknownField,
     DivByZero,
     MissingParam,
+    MissingRow,
     OutOfMemory,
 } || store_mod.StoreError;
 
@@ -44,6 +45,7 @@ pub const Ctx = struct {
     staged_updates: std.ArrayList(store_mod.QueuedUpdate) = .empty,
     staged_events: std.ArrayList(Event) = .empty,
     staged_diffs: std.ArrayList(*const ir.Diff) = .empty,
+    staged_begins: std.ArrayList(ir.Action.Begin) = .empty,
 
     /// Pre-bind a row var (kernel use: `diff` → staged_diff row when
     /// evaluating meta allow expressions).
@@ -83,6 +85,14 @@ pub fn eval(ctx: *Ctx, expr: *const ir.Expr) EvalError!Value {
             const key = try ctx.ta.alloc(Value, e.key.len);
             for (e.key, 0..) |*k, i| key[i] = try eval(ctx, k);
             return .{ .boolean = ctx.store.get(e.schema, key) != null };
+        },
+        .lookup => |l| {
+            const key = try ctx.ta.alloc(Value, l.key.len);
+            for (l.key, 0..) |*k, i| key[i] = try eval(ctx, k);
+            const row = ctx.store.get(l.schema, key) orelse return error.MissingRow;
+            const schema = ctx.store.schemas.get(l.schema) orelse return error.UnknownSchema;
+            const fi = schema.fieldIndex(l.field) orelse return error.UnknownField;
+            return row[fi];
         },
     }
 }
@@ -191,6 +201,9 @@ pub fn execActions(ctx: *Ctx, actions: []const ir.Action) EvalError!void {
             },
             .stage => |diff| {
                 try ctx.staged_diffs.append(ctx.ta, diff);
+            },
+            .begin => |b| {
+                try ctx.staged_begins.append(ctx.ta, b);
             },
         }
     }
@@ -335,6 +348,51 @@ test "exists tests row presence with evaluated keys" {
 
     try testing.expectEqual(Value{ .boolean = true }, try eval(&c, &has_north));
     try testing.expectEqual(Value{ .boolean = false }, try eval(&c, &has_ghost));
+}
+
+test "lookup reads a field by key; missing row errors" {
+    var rig = try TestRig.init();
+    defer rig.deinit();
+    var c = rig.ctx(1000);
+
+    const north = lit(.{ .symbol = try rig.sym("north") });
+    const ghost = lit(.{ .symbol = try rig.sym("ghost") });
+    const count = try rig.sym("count");
+
+    const found = ir.Expr{ .lookup = .{ .schema = rig.population, .key = &.{north}, .field = count } };
+    try testing.expectEqual(Value{ .int = 1000 }, try eval(&c, &found));
+
+    const missing = ir.Expr{ .lookup = .{ .schema = rig.population, .key = &.{ghost}, .field = count } };
+    try testing.expectError(error.MissingRow, eval(&c, &missing));
+
+    const bad_field = ir.Expr{ .lookup = .{ .schema = rig.population, .key = &.{north}, .field = try rig.sym("nope") } };
+    try testing.expectError(error.UnknownField, eval(&c, &bad_field));
+}
+
+test "begin stages the instance start, atomically with rule failure" {
+    var rig = try TestRig.init();
+    defer rig.deinit();
+    var c = rig.ctx(1000);
+
+    const bill = ir.Diff{
+        .name = try rig.sym("wool_act"),
+        .layer = try rig.sym("statute"),
+        .by = try rig.sym("baron"),
+        .via = try rig.sym("pass_statute"),
+        .ops = &.{},
+    };
+    const t = lit(.{ .boolean = true });
+    const begin = ir.Action{ .begin = .{ .procedure = bill.via, .bill = &bill } };
+    const rule = ir.Rule{ .name = bill.name, .on = try rig.sym("e"), .priority = 0, .layer = bill.layer, .when = &t, .do = &.{begin} };
+    try testing.expectEqual(true, try runRule(&c, &rule));
+    try testing.expectEqual(@as(usize, 1), c.staged_begins.items.len);
+    try testing.expectEqual(bill.name, c.staged_begins.items[0].bill.name);
+
+    var failing = rig.ctx(1000);
+    const boom = ir.Expr{ .bin = .{ .op = .div, .lhs = &t, .rhs = &t } };
+    const bad = ir.Rule{ .name = bill.name, .on = rule.on, .priority = 0, .layer = bill.layer, .when = &boom, .do = &.{begin} };
+    try testing.expectError(error.TypeMismatch, runRule(&failing, &bad));
+    try testing.expectEqual(@as(usize, 0), failing.staged_begins.items.len);
 }
 
 test "stage appends to staged_diffs, atomically with rule failure" {

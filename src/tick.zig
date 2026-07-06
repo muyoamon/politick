@@ -34,6 +34,13 @@ pub const KernelSyms = struct {
     facts_dropped: Symbol,
     diff_committed: Symbol,
     diff_rejected: Symbol,
+    // procedure machinery
+    proc_instance: Symbol,
+    instance_var: Symbol,
+    procedure_advanced: Symbol,
+    procedure_done: Symbol,
+    procedure_aborted: Symbol,
+    procedure_step_failed: Symbol,
     // rejection reasons
     r_l0: Symbol,
     r_unknown_target: Symbol,
@@ -42,12 +49,30 @@ pub const KernelSyms = struct {
     r_dangling: Symbol,
     r_denied: Symbol,
     r_bad_fact: Symbol,
+    r_forged_via: Symbol,
 };
 
 const StagedDiff = struct {
     diff: *const ir.Diff,
     since_tick: u64,
     seq: u64,
+    /// Staged by procedure completion (kernel), not by a rule's `stage`
+    /// action. Guards §2.5 "staged by procedure X" meta patterns against
+    /// forged `via` provenance.
+    by_procedure: bool = false,
+};
+
+/// An in-flight procedure instance. The bill is a Diff, so it lives here
+/// rather than in a fact row; scalars mirror into the kernel-layer
+/// proc_instance fact for rules to query. Position is tracked by step
+/// *name* and re-located in the freshly resolved definition every ADVANCE —
+/// re-resolve per step (§8.1) with no snapshot.
+const ProcInstance = struct {
+    id: Symbol,
+    procedure: Symbol,
+    bill: *const ir.Diff,
+    step_name: Symbol,
+    since_tick: u64,
 };
 
 const Rejection = struct { reason: Symbol, deps: []const Symbol = &.{} };
@@ -65,8 +90,10 @@ pub const World = struct {
     store: store_mod.FactStore = .{},
     rules: std.ArrayList(ir.Rule) = .empty,
     metas: std.ArrayList(ir.Meta) = .empty,
+    procedures: std.ArrayList(ir.Procedure) = .empty,
     rules_by_event: std.AutoArrayHashMapUnmanaged(Symbol, std.ArrayList(u32)) = .empty,
     staged: std.ArrayList(StagedDiff) = .empty,
+    instances: std.ArrayList(ProcInstance) = .empty,
     /// Kernel events raised outside ACT, delivered next tick.
     pending: std.ArrayList(interp.Event) = .empty,
     seq: u64 = 0,
@@ -89,6 +116,12 @@ pub const World = struct {
             .facts_dropped = try interner.intern(gpa, "facts_dropped"),
             .diff_committed = try interner.intern(gpa, "diff_committed"),
             .diff_rejected = try interner.intern(gpa, "diff_rejected"),
+            .proc_instance = try interner.intern(gpa, "proc_instance"),
+            .instance_var = try interner.intern(gpa, "instance"),
+            .procedure_advanced = try interner.intern(gpa, "procedure_advanced"),
+            .procedure_done = try interner.intern(gpa, "procedure_done"),
+            .procedure_aborted = try interner.intern(gpa, "procedure_aborted"),
+            .procedure_step_failed = try interner.intern(gpa, "procedure_step_failed"),
             .r_l0 = try interner.intern(gpa, "l0_target"),
             .r_unknown_target = try interner.intern(gpa, "unknown_target"),
             .r_duplicate = try interner.intern(gpa, "duplicate_term"),
@@ -96,6 +129,7 @@ pub const World = struct {
             .r_dangling = try interner.intern(gpa, "dangling_refs"),
             .r_denied = try interner.intern(gpa, "meta_denied"),
             .r_bad_fact = try interner.intern(gpa, "bad_fact"),
+            .r_forged_via = try interner.intern(gpa, "forged_via"),
         };
         // Intern everything before the interner moves into the World value;
         // interning afterwards through a copy could realloc and leave the
@@ -105,6 +139,9 @@ pub const World = struct {
         const f_by = try interner.intern(gpa, "by");
         const f_via = try interner.intern(gpa, "via");
         const f_since = try interner.intern(gpa, "since_tick");
+        const f_id = try interner.intern(gpa, "id");
+        const f_procedure = try interner.intern(gpa, "procedure");
+        const f_step = try interner.intern(gpa, "step");
 
         var world = World{
             .gpa = gpa,
@@ -130,6 +167,21 @@ pub const World = struct {
         try world.store.addSchema(arena, .{
             .name = syms.staged_diff,
             .fields = fields,
+            .key_len = 1,
+            .layer = syms.layer_kernel,
+        });
+        // proc_instance mirrors in-flight procedure instances (same pattern:
+        // kernel-layer, rows written only by the kernel in ADVANCE).
+        const inst_fields = try arena.dupe(ir.Field, &.{
+            .{ .name = f_id, .ty = .symbol },
+            .{ .name = f_procedure, .ty = .symbol },
+            .{ .name = f_step, .ty = .symbol },
+            .{ .name = f_by, .ty = .symbol },
+            .{ .name = f_since, .ty = .int },
+        });
+        try world.store.addSchema(arena, .{
+            .name = syms.proc_instance,
+            .fields = inst_fields,
             .key_len = 1,
             .layer = syms.layer_kernel,
         });
@@ -160,6 +212,7 @@ pub const World = struct {
                 try self.indexRule(@intCast(self.rules.items.len - 1));
             },
             .add_meta => |meta| try self.metas.append(arena, meta),
+            .add_procedure => |proc| try self.procedures.append(arena, proc),
             .add_fact => |fact| try self.store.insert(arena, fact.schema, fact.values),
             .remove_schema => |name| {
                 const count = self.store.removeSchema(name);
@@ -181,6 +234,16 @@ pub const World = struct {
                 for (self.metas.items, 0..) |m, i| {
                     if (m.name == name) {
                         _ = self.metas.orderedRemove(i);
+                        break;
+                    }
+                }
+            },
+            // In-flight instances are untouched here: the next ADVANCE
+            // re-resolves, finds nothing, and aborts them (§9).
+            .remove_procedure => |name| {
+                for (self.procedures.items, 0..) |p, i| {
+                    if (p.name == name) {
+                        _ = self.procedures.orderedRemove(i);
                         break;
                     }
                 }
@@ -238,15 +301,12 @@ pub const World = struct {
         // next tick's ACT, like every other write.
         for (self.staged.items) |sd| {
             if (sd.since_tick == self.tick) {
-                try self.store.insert(self.ir_arena.allocator(), self.syms.staged_diff, &.{
-                    .{ .symbol = sd.diff.name },
-                    .{ .symbol = sd.diff.layer },
-                    .{ .symbol = sd.diff.by },
-                    .{ .symbol = sd.diff.via },
-                    .{ .int = @intCast(sd.since_tick) },
-                });
+                try self.materializeStagedFact(sd.diff, sd.since_tick);
             }
         }
+
+        // Phase 2.5 ADVANCE: procedure instances re-resolve and step.
+        try self.phaseAdvance(ta);
 
         // Phase 3 COMMIT
         try self.phaseCommit(ta);
@@ -307,13 +367,16 @@ pub const World = struct {
         }
         try queue.appendSlice(ta, ctx.staged_events.items);
         for (ctx.staged_diffs.items) |diff| {
-            try self.stageDiff(diff);
+            try self.stageDiff(diff, false);
+        }
+        for (ctx.staged_begins.items) |b| {
+            try self.beginInstance(b);
         }
     }
 
     /// Re-staging a name replaces the earlier staged diff (deterministic:
     /// staging order is rule order).
-    fn stageDiff(self: *World, diff: *const ir.Diff) !void {
+    fn stageDiff(self: *World, diff: *const ir.Diff, by_procedure: bool) !void {
         for (self.staged.items, 0..) |sd, i| {
             if (sd.diff.name == diff.name) {
                 _ = self.staged.orderedRemove(i);
@@ -325,6 +388,155 @@ pub const World = struct {
             .diff = diff,
             .since_tick = self.tick,
             .seq = self.seq,
+            .by_procedure = by_procedure,
+        });
+    }
+
+    fn materializeStagedFact(self: *World, diff: *const ir.Diff, since_tick: u64) !void {
+        try self.store.insert(self.ir_arena.allocator(), self.syms.staged_diff, &.{
+            .{ .symbol = diff.name },
+            .{ .symbol = diff.layer },
+            .{ .symbol = diff.by },
+            .{ .symbol = diff.via },
+            .{ .int = @intCast(since_tick) },
+        });
+    }
+
+    /// A begin resolves its procedure at fire time (§2.4) — a missing
+    /// procedure is a defined runtime outcome (abort event), never an
+    /// error. Re-beginning an id replaces the in-flight instance, like
+    /// re-staging a diff.
+    fn beginInstance(self: *World, b: ir.Action.Begin) !void {
+        for (self.instances.items, 0..) |inst, i| {
+            if (inst.id == b.bill.name) {
+                _ = self.store.removeFact(self.syms.proc_instance, &.{.{ .symbol = inst.id }});
+                _ = self.instances.orderedRemove(i);
+                break;
+            }
+        }
+        const proc = self.findProcedure(b.procedure) orelse {
+            try self.pendKernel(self.syms.procedure_aborted, &.{
+                .{ .symbol = b.bill.name },
+                .{ .symbol = b.procedure },
+            });
+            return;
+        };
+        try self.instances.append(self.ir_arena.allocator(), .{
+            .id = b.bill.name,
+            .procedure = b.procedure,
+            .bill = b.bill,
+            .step_name = proc.steps[0].name,
+            .since_tick = self.tick,
+        });
+    }
+
+    /// Phase 2.5 ADVANCE. Every in-flight instance re-resolves its procedure
+    /// and current step by name (§8.1 — no snapshot), so a definition change
+    /// affects remaining steps only; a vanished procedure or step aborts the
+    /// instance with a kernel event (§9). A satisfied `requires` advances at
+    /// most one step per tick, so passage is genuinely multi-tick and every
+    /// step is observable through the proc_instance fact.
+    fn phaseAdvance(self: *World, ta: std.mem.Allocator) !void {
+        var i: usize = 0;
+        while (i < self.instances.items.len) {
+            const inst = self.instances.items[i];
+            const proc = self.findProcedure(inst.procedure) orelse {
+                try self.abortInstance(i);
+                continue;
+            };
+            const step_idx = proc.stepIndex(inst.step_name) orelse {
+                try self.abortInstance(i);
+                continue;
+            };
+            // The requires expr sees the instance as a transient row bound
+            // to `instance` — built here because new instances have no
+            // materialized fact row yet.
+            const row = try ta.dupe(interp.Value, &.{
+                .{ .symbol = inst.id },
+                .{ .symbol = inst.procedure },
+                .{ .symbol = inst.step_name },
+                .{ .symbol = inst.bill.by },
+                .{ .int = @intCast(inst.since_tick) },
+            });
+            var ictx = interp.Ctx{
+                .ta = ta,
+                .store = &self.store,
+                .param_schema = self.syms.param,
+                .fuel = fuel_budget,
+                .priority = 0,
+                .next_seq = &self.seq,
+            };
+            ictx.bind(self.syms.instance_var, self.syms.proc_instance, row);
+            const satisfied = blk: {
+                const v = interp.eval(&ictx, proc.steps[step_idx].requires) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => {
+                        try self.pendKernel(self.syms.procedure_step_failed, &.{
+                            .{ .symbol = inst.id },
+                            .{ .symbol = inst.step_name },
+                        });
+                        break :blk false;
+                    },
+                };
+                if (v != .boolean) {
+                    try self.pendKernel(self.syms.procedure_step_failed, &.{
+                        .{ .symbol = inst.id },
+                        .{ .symbol = inst.step_name },
+                    });
+                    break :blk false;
+                }
+                break :blk v.boolean;
+            };
+            if (!satisfied) {
+                try self.upsertInstanceFact(inst);
+                i += 1;
+            } else if (step_idx + 1 < proc.steps.len) {
+                self.instances.items[i].step_name = proc.steps[step_idx + 1].name;
+                try self.pendKernel(self.syms.procedure_advanced, &.{
+                    .{ .symbol = inst.id },
+                    .{ .symbol = self.instances.items[i].step_name },
+                });
+                try self.upsertInstanceFact(self.instances.items[i]);
+                i += 1;
+            } else {
+                // Final step satisfied: stage the bill with its provenance
+                // rewritten to the procedure that actually carried it —
+                // this is what §2.5 "staged by procedure X" metas trust.
+                const arena = self.ir_arena.allocator();
+                const bill = try arena.create(ir.Diff);
+                bill.* = inst.bill.*;
+                bill.via = inst.procedure;
+                try self.stageDiff(bill, true);
+                // Materialize its staged_diff fact now: judge Pass 4 binds
+                // this row at the same tick's COMMIT.
+                try self.materializeStagedFact(bill, self.tick);
+                try self.pendKernel(self.syms.procedure_done, &.{
+                    .{ .symbol = inst.id },
+                    .{ .symbol = inst.procedure },
+                });
+                _ = self.store.removeFact(self.syms.proc_instance, &.{.{ .symbol = inst.id }});
+                _ = self.instances.orderedRemove(i);
+            }
+        }
+    }
+
+    fn abortInstance(self: *World, i: usize) !void {
+        const inst = self.instances.items[i];
+        try self.pendKernel(self.syms.procedure_aborted, &.{
+            .{ .symbol = inst.id },
+            .{ .symbol = inst.procedure },
+        });
+        _ = self.store.removeFact(self.syms.proc_instance, &.{.{ .symbol = inst.id }});
+        _ = self.instances.orderedRemove(i);
+    }
+
+    fn upsertInstanceFact(self: *World, inst: ProcInstance) !void {
+        try self.store.insert(self.ir_arena.allocator(), self.syms.proc_instance, &.{
+            .{ .symbol = inst.id },
+            .{ .symbol = inst.procedure },
+            .{ .symbol = inst.step_name },
+            .{ .symbol = inst.bill.by },
+            .{ .int = @intCast(inst.since_tick) },
         });
     }
 
@@ -364,6 +576,13 @@ pub const World = struct {
         var touched_layers: std.ArrayList(Symbol) = .empty;
         var removed_schemas: std.ArrayList(Symbol) = .empty;
         var added_schemas: std.ArrayList(ir.Schema) = .empty;
+        var removed_procedures: std.ArrayList(Symbol) = .empty;
+
+        // A diff whose `via` names a live procedure must actually have been
+        // staged by that procedure's completion — otherwise any rule could
+        // counterfeit the provenance that §2.5 metas gate on.
+        if (!sd.by_procedure and self.findProcedure(diff.via) != null)
+            return .{ .reject = .{ .reason = self.syms.r_forged_via, .deps = &.{diff.via} } };
 
         // Pass 1: every op's target must exist (removes) or be new
         // (adds), must not touch layer "kernel", and contributes its
@@ -386,6 +605,14 @@ pub const World = struct {
                         return .{ .reject = .{ .reason = self.syms.r_duplicate, .deps = &.{m.name} } };
                     break :blk m.layer;
                 },
+                // Remove+add of the same name in one diff is replacement —
+                // the mid-passage amendment tactic (§8.1) — so the duplicate
+                // check honors this diff's own removes, like schemas do.
+                .add_procedure => |p| blk: {
+                    if (self.findProcedure(p.name) != null and !containsSym(removed_procedures.items, p.name))
+                        return .{ .reject = .{ .reason = self.syms.r_duplicate, .deps = &.{p.name} } };
+                    break :blk p.layer;
+                },
                 .remove_schema => |name| blk: {
                     const schema = self.store.schemas.get(name) orelse
                         return .{ .reject = .{ .reason = self.syms.r_unknown_target, .deps = &.{name} } };
@@ -401,6 +628,12 @@ pub const World = struct {
                     const meta = self.findMeta(name) orelse
                         return .{ .reject = .{ .reason = self.syms.r_unknown_target, .deps = &.{name} } };
                     break :blk meta.layer;
+                },
+                .remove_procedure => |name| blk: {
+                    const proc = self.findProcedure(name) orelse
+                        return .{ .reject = .{ .reason = self.syms.r_unknown_target, .deps = &.{name} } };
+                    try removed_procedures.append(ta, name);
+                    break :blk proc.layer;
                 },
                 .add_fact => |f| blk: {
                     const schema = self.lookupSchemaIn(f.schema, added_schemas.items) orelse
@@ -447,20 +680,33 @@ pub const World = struct {
                     if (diffRemoves(diff, .remove_meta, m.name)) continue;
                     if (check.metaRefersToSchema(m, gone, self.syms.param)) try deps.append(ta, m.name);
                 }
+                for (self.procedures.items) |p| {
+                    if (diffRemoves(diff, .remove_procedure, p.name)) continue;
+                    if (check.procedureRefersToSchema(p, gone, self.syms.param)) try deps.append(ta, p.name);
+                }
                 for (diff.ops) |op| switch (op) {
                     .add_rule => |r| if (check.ruleRefersToSchema(r, gone, self.syms.param)) try deps.append(ta, r.name),
                     .add_meta => |m| if (check.metaRefersToSchema(m, gone, self.syms.param)) try deps.append(ta, m.name),
+                    .add_procedure => |p| if (check.procedureRefersToSchema(p, gone, self.syms.param)) try deps.append(ta, p.name),
                     else => {},
                 };
             }
             if (deps.items.len > 0)
                 return .{ .reject = .{ .reason = self.syms.r_dangling, .deps = deps.items } };
         }
+        // Procedure requires exprs check under the binding ADVANCE injects.
+        const proc_ctx = check.Ctx{
+            .view = view,
+            .param_schema = self.syms.param,
+            .prebound = &.{.{ .name = self.syms.instance_var, .schema = self.syms.proc_instance }},
+        };
         for (diff.ops) |op| switch (op) {
             .add_rule => |r| check.checkRule(&ctx, r) catch
                 return .{ .reject = .{ .reason = self.syms.r_dangling, .deps = &.{r.name} } },
             .add_meta => |m| check.checkMetaAllow(&ctx, m) catch
                 return .{ .reject = .{ .reason = self.syms.r_dangling, .deps = &.{m.name} } },
+            .add_procedure => |p| check.checkProcedure(&proc_ctx, p) catch
+                return .{ .reject = .{ .reason = self.syms.r_dangling, .deps = &.{p.name} } },
             else => {},
         };
 
@@ -517,6 +763,15 @@ pub const World = struct {
         return null;
     }
 
+    /// The §2.4 decision-time lookup: ADVANCE, begin actions, and the judge
+    /// all resolve procedures through here, fresh every time — never cached.
+    pub fn findProcedure(self: *const World, name: Symbol) ?*const ir.Procedure {
+        for (self.procedures.items) |*p| {
+            if (p.name == name) return p;
+        }
+        return null;
+    }
+
     fn lookupSchemaIn(self: *const World, name: Symbol, added: []const ir.Schema) ?ir.Schema {
         for (added) |s| {
             if (s.name == name) return s;
@@ -553,6 +808,20 @@ pub const World = struct {
             h.writeU32(m.governs_layer.index());
             h.writeU32(m.min_staged_ticks);
         }
+
+        // Instances are covered through their proc_instance facts; bill
+        // contents are not hashed, consistent with staged diffs (only the
+        // staged_diff fact is).
+        h.writeBytes("procedures.v1");
+        h.writeU64(self.procedures.items.len);
+        const proc_order = try sortedIndices(scratch, self.procedures.items.len, self.procedures.items, procIdLessThan);
+        for (proc_order) |i| {
+            const p = self.procedures.items[i];
+            h.writeU32(p.name.index());
+            h.writeU32(p.layer.index());
+            h.writeU64(p.steps.len);
+            for (p.steps) |s| h.writeU32(s.name.index());
+        }
         return h.finish();
     }
 };
@@ -576,6 +845,13 @@ fn metaIdLessThan(items: []const ir.Meta, a: usize, b: usize) bool {
     const mb = items[b];
     if (ma.name != mb.name) return ma.name.index() < mb.name.index();
     return ma.governs_layer.index() < mb.governs_layer.index();
+}
+
+fn procIdLessThan(items: []const ir.Procedure, a: usize, b: usize) bool {
+    const pa = items[a];
+    const pb = items[b];
+    if (pa.name != pb.name) return pa.name.index() < pb.name.index();
+    return pa.layer.index() < pb.layer.index();
 }
 
 fn diffRemoves(diff: *const ir.Diff, comptime kind: std.meta.Tag(ir.DiffOp), name: Symbol) bool {

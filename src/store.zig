@@ -139,7 +139,9 @@ pub const FactStore = struct {
                 },
             }
         }
-        self.queued.clearRetainingCapacity();
+        // Abandon the buffer rather than retain it: it lives in the tick
+        // arena, so retained capacity would dangle into next tick.
+        self.queued = .empty;
     }
 
     /// Canonical state hash: schemas in symbol order — identity (layer,

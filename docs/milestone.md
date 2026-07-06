@@ -79,17 +79,38 @@ commits); a valid statute commits atomically (state-hash equality on
 reject), delay keeps diffs staged and fact-visible, and the replay tests
 hold with staging active.
 
-## M3 — Procedures (slice 3)
+## M3 — Procedures (slice 3) ✅ (2026-07-06)
 
-- `procedure` IR as sugar over facts + rules; step state machine.
-- Re-resolve per step (kernel invariant, §8); procedure removed mid-flight
-  ⇒ instance aborts with a kernel event.
-- `pass_statute` (§2.4) works end to end: a bill introduced, voted,
-  assented, staged, committed.
+- `procedure` IR (named steps with `requires` exprs), first-class on the
+  world like rules/metas; `add_procedure`/`remove_procedure` diff ops with
+  remove+add-in-one-diff as replacement. Completion semantics are fixed
+  kernel behavior: the final step stages the carried bill with `via`
+  rewritten to the procedure name and emits `procedure_done`.
+- Instances live on the world (the bill is a `Diff`, not a fact) and mirror
+  into a kernel-layer `proc_instance` fact — the `staged_diff` pattern —
+  so rules can gate on the current step.
+- New ADVANCE pass between APPLY and COMMIT: each instance re-resolves its
+  procedure *and* current step by name (§8.1, kernel invariant), advances
+  at most one step per tick, and aborts with `procedure_aborted` when the
+  procedure or step vanished (§9 — the only abort path; `remove_procedure`
+  just removes the definition).
+- New `begin` action (starts an instance; missing procedure ⇒ abort event,
+  never an error) and `lookup` expr (single-row field read, `param`
+  generalized — needed for vote-threshold `requires`).
+- Forged-provenance guard: a diff whose `via` names a live procedure must
+  have been staged by that procedure's completion (`forged_via` rejection),
+  making §2.5 "staged by procedure X" metas trustworthy.
+- Fixed a latent use-after-free: the fact store's update queue retained
+  capacity from the per-tick arena across ticks.
 
-**Exit criteria:** a statute passes through the full procedure across
-multiple ticks and commits; changing a procedure mid-passage affects
-remaining steps only; the replay test still holds.
+**Exit criteria (met):** the M3 suite (`src/procedure_test.zig`) passes —
+`pass_statute` runs end to end across ticks 4–6 (introduced, voted,
+assented, staged, committed) with the bill's rule firing after; a
+mid-passage replacement reroutes the remaining steps only (old assent
+never runs, new royal seal does); removing the procedure (or its current
+step) mid-flight aborts with a kernel event; forged `via` is rejected; the
+two-world determinism test and the re-blessed golden digest hold, and the
+CLI replays byte-identically.
 
 ## M4 — Persona driver (slice 4)
 

@@ -16,7 +16,10 @@ const poll_tax_log = @embedFile("testdata/poll_tax.ndjson");
 /// Paste-updated from a verified run; see file doc comment.
 /// M2 change: the state hash grew to cover schema identity (layer, fields),
 /// rule/meta term identities, and the kernel staged_diff schema.
-const golden_digest = "afeca25cb6acb75146d7f255889bdaae90a83cc971a4326256a0c7446cbc8002";
+/// M3 change: new kernel syms shifted symbol ids, the kernel proc_instance
+/// schema joined the fact hash, and procedure identities joined the state
+/// hash ("procedures.v1" section).
+const golden_digest = "34bca2c4b722dc876181350cffc13777c69bd860f8aa89700463faefd51340de";
 
 test "poll tax world: 100 ticks, semantic drift, golden digest" {
     const gpa = std.testing.allocator;

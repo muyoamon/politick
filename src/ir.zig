@@ -41,10 +41,13 @@ pub const Expr = union(enum) {
     not: *const Expr,
     /// Row-presence test — the §5 capability check in expression form.
     exists: Exists,
+    /// Single-row field read by key — `param` generalized to any schema.
+    lookup: Lookup,
 
     pub const FieldRef = struct { row_var: Symbol, field_name: Symbol };
     pub const Bin = struct { op: BinOp, lhs: *const Expr, rhs: *const Expr };
     pub const Exists = struct { schema: Symbol, key: []const Expr };
+    pub const Lookup = struct { schema: Symbol, key: []const Expr, field: Symbol };
 };
 
 pub const UpdateOp = enum { set, add };
@@ -56,8 +59,13 @@ pub const Action = union(enum) {
     /// Stage a diff for COMMIT validation. The embedded diff's contents are
     /// validated when it commits, not when the containing rule is checked.
     stage: *const Diff,
+    /// Start a procedure instance carrying `bill`. The procedure resolves by
+    /// name when the action fires (§2.4 — never cached); a missing procedure
+    /// aborts with a kernel event, not an error.
+    begin: Begin,
 
     pub const Emit = struct { event: Symbol, args: []const Expr };
+    pub const Begin = struct { procedure: Symbol, bill: *const Diff };
     pub const Update = struct {
         schema: Symbol,
         key: []const Expr,
@@ -75,6 +83,28 @@ pub const Rule = struct {
     layer: Symbol,
     when: *const Expr,
     do: []const Action,
+};
+
+pub const Step = struct {
+    name: Symbol,
+    /// Evaluated with the instance's proc_instance row bound to `instance`.
+    requires: *const Expr,
+};
+
+/// Multi-step protocol (§2.4): a named step sequence over an instance state
+/// machine. First-class so actors can query "how do I pass a statute";
+/// completing the final step stages the carried bill (kernel semantics).
+pub const Procedure = struct {
+    name: Symbol,
+    layer: Symbol,
+    steps: []const Step,
+
+    pub fn stepIndex(self: Procedure, name: Symbol) ?usize {
+        for (self.steps, 0..) |s, i| {
+            if (s.name == name) return i;
+        }
+        return null;
+    }
 };
 
 /// Amendment rule: governs diffs touching terms at `governs_layer`.
@@ -105,10 +135,12 @@ pub const DiffOp = union(enum) {
     add_schema: Schema,
     add_rule: Rule,
     add_meta: Meta,
+    add_procedure: Procedure,
     add_fact: AddFact,
     remove_schema: Symbol,
     remove_rule: Symbol,
     remove_meta: Symbol,
+    remove_procedure: Symbol,
     remove_fact: RemoveFact,
 };
 
@@ -165,6 +197,8 @@ pub const Decoder = struct {
             return .{ .add_rule = try self.decodeRule(kv.val) };
         } else if (std.mem.eql(u8, kv.key, "add_meta")) {
             return .{ .add_meta = try self.decodeMeta(kv.val) };
+        } else if (std.mem.eql(u8, kv.key, "add_procedure")) {
+            return .{ .add_procedure = try self.decodeProcedure(kv.val) };
         } else if (std.mem.eql(u8, kv.key, "add_fact")) {
             return .{ .add_fact = try self.decodeFact(kv.val) };
         } else if (std.mem.eql(u8, kv.key, "remove_schema")) {
@@ -173,6 +207,8 @@ pub const Decoder = struct {
             return .{ .remove_rule = try self.internSym(kv.val) };
         } else if (std.mem.eql(u8, kv.key, "remove_meta")) {
             return .{ .remove_meta = try self.internSym(kv.val) };
+        } else if (std.mem.eql(u8, kv.key, "remove_procedure")) {
+            return .{ .remove_procedure = try self.internSym(kv.val) };
         } else if (std.mem.eql(u8, kv.key, "remove_fact")) {
             const obj = try object(kv.val);
             const key_json = obj.get("key") orelse return error.BadIr;
@@ -203,6 +239,32 @@ pub const Decoder = struct {
             .governs_layer = try self.internSym(obj.get("governs") orelse return error.BadIr),
             .min_staged_ticks = min,
             .allow = try self.decodeExpr(obj.get("allow") orelse return error.BadIr),
+        };
+    }
+
+    fn decodeProcedure(self: *Decoder, json: std.json.Value) DecodeError!Procedure {
+        const obj = try object(json);
+        const steps_json = obj.get("steps") orelse return error.BadIr;
+        if (steps_json != .array) return error.BadIr;
+        // Instances track their position by step name (re-resolve per step,
+        // §8.1), so steps must be non-empty and uniquely named.
+        if (steps_json.array.items.len == 0) return error.BadIr;
+        const steps = try self.arena.alloc(Step, steps_json.array.items.len);
+        for (steps_json.array.items, 0..) |sj, i| {
+            const sobj = try object(sj);
+            const step = Step{
+                .name = try self.internSym(sobj.get("name") orelse return error.BadIr),
+                .requires = try self.decodeExpr(sobj.get("requires") orelse return error.BadIr),
+            };
+            for (steps[0..i]) |prev| {
+                if (prev.name == step.name) return error.BadIr;
+            }
+            steps[i] = step;
+        }
+        return .{
+            .name = try self.internSym(obj.get("name") orelse return error.BadIr),
+            .layer = try self.layerOf(obj),
+            .steps = steps,
         };
     }
 
@@ -321,6 +383,13 @@ pub const Decoder = struct {
             const diff = try self.arena.create(Diff);
             diff.* = try self.decodeDiffObject(kv.val);
             return .{ .stage = diff };
+        } else if (std.mem.eql(u8, kv.key, "begin")) {
+            const bill = try self.arena.create(Diff);
+            bill.* = try self.decodeDiffObject(obj.get("bill") orelse return error.BadIr);
+            return .{ .begin = .{
+                .procedure = try self.internSym(obj.get("procedure") orelse return error.BadIr),
+                .bill = bill,
+            } };
         }
         return error.BadIr;
     }
@@ -360,6 +429,19 @@ pub const Decoder = struct {
             e.* = .{ .exists = .{
                 .schema = try self.internSym(obj.get("schema") orelse return error.BadIr),
                 .key = key,
+            } };
+        } else if (std.mem.eql(u8, kv.key, "lookup")) {
+            const obj = try object(kv.val);
+            const key_json = obj.get("key") orelse return error.BadIr;
+            if (key_json != .array) return error.BadIr;
+            const key = try self.arena.alloc(Expr, key_json.array.items.len);
+            for (key_json.array.items, 0..) |kj, i| {
+                key[i] = (try self.decodeExpr(kj)).*;
+            }
+            e.* = .{ .lookup = .{
+                .schema = try self.internSym(obj.get("schema") orelse return error.BadIr),
+                .key = key,
+                .field = try self.internSym(obj.get("field") orelse return error.BadIr),
             } };
         } else {
             return error.BadIr;
@@ -510,6 +592,62 @@ test "rejects malformed IR" {
         "[{\"add_schema\":{\"name\":\"s\",\"fields\":[[\"a\",\"int\"]],\"key\":2}}]", // key > fields
         // Forged kernel event in emit:
         "[{\"add_rule\":{\"name\":\"r\",\"on\":\"e\",\"when\":{\"lit\":true},\"do\":[{\"emit\":{\"event\":\"tick.start\",\"args\":[]}}]}}]",
+    };
+    for (cases) |case| {
+        var t = TestSetup.init();
+        defer t.deinit();
+        try std.testing.expectError(error.BadIr, t.decode(case));
+    }
+}
+
+test "decodes procedures, begin actions, and lookup exprs" {
+    var t = TestSetup.init();
+    defer t.deinit();
+
+    const ops = try t.decode(
+        \\[
+        \\ {"add_procedure":{"name":"pass_statute","layer":"organic","steps":[
+        \\   {"name":"introduce","requires":{"exists":{"schema":"seat","key":[{"field":["instance","by"]}]}}},
+        \\   {"name":"floor_vote","requires":{"bin":["gt",
+        \\     {"lookup":{"schema":"vote","key":[{"field":["instance","id"]}],"field":"yes"}},{"lit":1}]}}
+        \\ ]}},
+        \\ {"add_rule":{"name":"sponsor","on":"tick.quarter","when":{"lit":true},"do":[
+        \\   {"begin":{"procedure":"pass_statute","bill":{"name":"wool_act","by":"baron","via":"pass_statute","ops":[]}}}
+        \\ ]}},
+        \\ {"remove_procedure":"pass_statute"}
+        \\]
+    );
+
+    const proc = ops[0].add_procedure;
+    try std.testing.expectEqualStrings("organic", t.interner.lookup(proc.layer));
+    try std.testing.expectEqual(@as(usize, 2), proc.steps.len);
+    try std.testing.expectEqual(@as(?usize, 1), proc.stepIndex(proc.steps[1].name));
+    const lk = proc.steps[1].requires.bin.lhs.lookup;
+    try std.testing.expectEqualStrings("vote", t.interner.lookup(lk.schema));
+    try std.testing.expectEqualStrings("yes", t.interner.lookup(lk.field));
+    try std.testing.expectEqual(@as(usize, 1), lk.key.len);
+
+    const begin = ops[1].add_rule.do[0].begin;
+    try std.testing.expectEqual(proc.name, begin.procedure);
+    try std.testing.expectEqualStrings("wool_act", t.interner.lookup(begin.bill.name));
+
+    try std.testing.expectEqual(proc.name, ops[2].remove_procedure);
+}
+
+test "rejects malformed procedures" {
+    const cases = [_][]const u8{
+        // zero steps
+        "[{\"add_procedure\":{\"name\":\"p\",\"steps\":[]}}]",
+        // duplicate step names
+        \\[{"add_procedure":{"name":"p","steps":[
+        \\  {"name":"a","requires":{"lit":true}},
+        \\  {"name":"a","requires":{"lit":true}}
+        \\]}}]
+        ,
+        // step missing requires
+        "[{\"add_procedure\":{\"name\":\"p\",\"steps\":[{\"name\":\"a\"}]}}]",
+        // lookup missing field
+        "[{\"add_rule\":{\"name\":\"r\",\"on\":\"e\",\"when\":{\"lookup\":{\"schema\":\"s\",\"key\":[]}},\"do\":[]}}]",
     };
     for (cases) |case| {
         var t = TestSetup.init();

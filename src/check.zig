@@ -71,6 +71,15 @@ pub fn checkMetaAllow(ctx: *const Ctx, meta: ir.Meta) CheckError!void {
     try checkExpr(ctx, &env, meta.allow);
 }
 
+/// Checks every step's `requires`; the ctx should prebind `instance` →
+/// proc_instance, the row the kernel injects at each advance evaluation.
+pub fn checkProcedure(ctx: *const Ctx, proc: ir.Procedure) CheckError!void {
+    for (proc.steps) |step| {
+        var env = try preboundEnv(ctx);
+        try checkExpr(ctx, &env, step.requires);
+    }
+}
+
 fn preboundEnv(ctx: *const Ctx) CheckError!Env {
     var env = Env{};
     for (ctx.prebound) |b| {
@@ -101,6 +110,12 @@ fn checkExpr(ctx: *const Ctx, env: *Env, expr: *const ir.Expr) CheckError!void {
             if (e.key.len != schema.key_len) return error.ArityMismatch;
             for (e.key) |*k| try checkExpr(ctx, env, k);
         },
+        .lookup => |l| {
+            const schema = ctx.view.get(l.schema) orelse return error.UnknownSchema;
+            if (l.key.len != schema.key_len) return error.ArityMismatch;
+            if (schema.fieldIndex(l.field) == null) return error.UnknownField;
+            for (l.key) |*k| try checkExpr(ctx, env, k);
+        },
     }
 }
 
@@ -124,8 +139,9 @@ fn checkActions(ctx: *const Ctx, env: *Env, actions: []const ir.Action) CheckErr
                 defer env.len -= 1;
                 try checkActions(ctx, env, f.body);
             },
-            // Validated when the embedded diff itself commits.
-            .stage => {},
+            // Validated when the embedded diff itself commits; a begin's
+            // procedure resolves at fire time (§2.4), never statically.
+            .stage, .begin => {},
         }
     }
 }
@@ -141,6 +157,13 @@ pub fn metaRefersToSchema(meta: ir.Meta, target: Symbol, param_schema: Symbol) b
     return exprRefs(meta.allow, target, param_schema);
 }
 
+pub fn procedureRefersToSchema(proc: ir.Procedure, target: Symbol, param_schema: Symbol) bool {
+    for (proc.steps) |step| {
+        if (exprRefs(step.requires, target, param_schema)) return true;
+    }
+    return false;
+}
+
 fn exprRefs(expr: *const ir.Expr, target: Symbol, param_schema: Symbol) bool {
     return switch (expr.*) {
         .lit, .field => false,
@@ -149,6 +172,12 @@ fn exprRefs(expr: *const ir.Expr, target: Symbol, param_schema: Symbol) bool {
         .not => |inner| exprRefs(inner, target, param_schema),
         .exists => |e| e.schema == target or blk: {
             for (e.key) |*k| {
+                if (exprRefs(k, target, param_schema)) break :blk true;
+            }
+            break :blk false;
+        },
+        .lookup => |l| l.schema == target or blk: {
+            for (l.key) |*k| {
                 if (exprRefs(k, target, param_schema)) break :blk true;
             }
             break :blk false;
@@ -172,7 +201,7 @@ fn actionsRef(actions: []const ir.Action, target: Symbol, param_schema: Symbol) 
                 break :blk false;
             },
             .foreach => |f| f.schema == target or actionsRef(f.body, target, param_schema),
-            .stage => false,
+            .stage, .begin => false,
         };
         if (hit) return true;
     }
@@ -286,4 +315,46 @@ test "refersToSchema sees exists, foreach, update, and param refs" {
     const rule = ir.Rule{ .name = try t.sym("r"), .on = other, .priority = 0, .layer = other, .when = &uses_param, .do = &.{} };
     try testing.expect(ruleRefersToSchema(rule, param, param));
     try testing.expect(!ruleRefersToSchema(rule, office, param));
+}
+
+test "checkProcedure resolves lookups under the instance prebinding" {
+    var t = TestSetup.init();
+    defer t.deinit();
+    const vote = try t.addSchema("vote", &.{ .{ "bill", .symbol }, .{ "yes", .int } }, 1);
+    const proc_instance = try t.addSchema("proc_instance", &.{ .{ "id", .symbol }, .{ "step", .symbol } }, 1);
+    const instance = try t.sym("instance");
+    const ctx = Ctx{
+        .view = .{ .base = &t.schemas },
+        .param_schema = try t.sym("param"),
+        .prebound = &.{.{ .name = instance, .schema = proc_instance }},
+    };
+
+    const id_ref = ir.Expr{ .field = .{ .row_var = instance, .field_name = try t.sym("id") } };
+    const yes = try t.sym("yes");
+    const tally = ir.Expr{ .lookup = .{ .schema = vote, .key = &.{id_ref}, .field = yes } };
+    const good = ir.Procedure{ .name = try t.sym("p"), .layer = try t.sym("organic"), .steps = &.{
+        .{ .name = try t.sym("floor_vote"), .requires = &tally },
+    } };
+    try checkProcedure(&ctx, good);
+
+    // Without the prebinding the instance field ref is unbound.
+    const bare = Ctx{ .view = ctx.view, .param_schema = ctx.param_schema };
+    try testing.expectError(error.UnboundVar, checkProcedure(&bare, good));
+
+    // Unknown field, wrong key arity, unknown schema.
+    const bad_field = ir.Expr{ .lookup = .{ .schema = vote, .key = &.{id_ref}, .field = try t.sym("nope") } };
+    const bad_proc = ir.Procedure{ .name = good.name, .layer = good.layer, .steps = &.{
+        .{ .name = good.steps[0].name, .requires = &bad_field },
+    } };
+    try testing.expectError(error.UnknownField, checkProcedure(&ctx, bad_proc));
+
+    const bad_arity = ir.Expr{ .lookup = .{ .schema = vote, .key = &.{ id_ref, id_ref }, .field = yes } };
+    const arity_proc = ir.Procedure{ .name = good.name, .layer = good.layer, .steps = &.{
+        .{ .name = good.steps[0].name, .requires = &bad_arity },
+    } };
+    try testing.expectError(error.ArityMismatch, checkProcedure(&ctx, arity_proc));
+
+    // Removal closure sees refs through lookup exprs.
+    try testing.expect(procedureRefersToSchema(good, vote, ctx.param_schema));
+    try testing.expect(!procedureRefersToSchema(good, proc_instance, ctx.param_schema));
 }
