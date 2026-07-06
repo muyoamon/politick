@@ -14,7 +14,9 @@ const value_mod = @import("value.zig");
 const poll_tax_log = @embedFile("testdata/poll_tax.ndjson");
 
 /// Paste-updated from a verified run; see file doc comment.
-const golden_digest = "a3c3deb3dc5afa08f7c9f3616e2d2d688df2ce36b03878dd0c0d09f8ae335f19";
+/// M2 change: the state hash grew to cover schema identity (layer, fields),
+/// rule/meta term identities, and the kernel staged_diff schema.
+const golden_digest = "afeca25cb6acb75146d7f255889bdaae90a83cc971a4326256a0c7446cbc8002";
 
 test "poll tax world: 100 ticks, semantic drift, golden digest" {
     const gpa = std.testing.allocator;

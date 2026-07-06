@@ -20,6 +20,7 @@ pub const Schema = struct {
     fields: []const Field,
     /// The first `key_len` fields form the row key.
     key_len: u8,
+    layer: Symbol,
 
     pub fn fieldIndex(self: Schema, name: Symbol) ?usize {
         for (self.fields, 0..) |f, i| {
@@ -38,9 +39,12 @@ pub const Expr = union(enum) {
     param: Symbol,
     bin: Bin,
     not: *const Expr,
+    /// Row-presence test — the §5 capability check in expression form.
+    exists: Exists,
 
     pub const FieldRef = struct { row_var: Symbol, field_name: Symbol };
     pub const Bin = struct { op: BinOp, lhs: *const Expr, rhs: *const Expr };
+    pub const Exists = struct { schema: Symbol, key: []const Expr };
 };
 
 pub const UpdateOp = enum { set, add };
@@ -49,6 +53,9 @@ pub const Action = union(enum) {
     emit: Emit,
     update: Update,
     foreach: Foreach,
+    /// Stage a diff for COMMIT validation. The embedded diff's contents are
+    /// validated when it commits, not when the containing rule is checked.
+    stage: *const Diff,
 
     pub const Emit = struct { event: Symbol, args: []const Expr };
     pub const Update = struct {
@@ -65,16 +72,44 @@ pub const Rule = struct {
     name: Symbol,
     on: Symbol,
     priority: i32,
+    layer: Symbol,
     when: *const Expr,
     do: []const Action,
 };
 
+/// Amendment rule: governs diffs touching terms at `governs_layer`.
+pub const Meta = struct {
+    name: Symbol,
+    layer: Symbol,
+    governs_layer: Symbol,
+    /// Ticks a diff must survive staged before it may commit (§2.5 delay).
+    min_staged_ticks: u32,
+    /// Evaluated with the diff's staged_diff fact row bound to var `diff`.
+    allow: *const Expr,
+};
+
 pub const AddFact = struct { schema: Symbol, values: []const Value };
+
+pub const RemoveFact = struct { schema: Symbol, key: []const Value };
+
+/// The statute object (§3): a named op set with provenance.
+pub const Diff = struct {
+    name: Symbol,
+    layer: Symbol,
+    by: Symbol,
+    via: Symbol,
+    ops: []const DiffOp,
+};
 
 pub const DiffOp = union(enum) {
     add_schema: Schema,
     add_rule: Rule,
+    add_meta: Meta,
     add_fact: AddFact,
+    remove_schema: Symbol,
+    remove_rule: Symbol,
+    remove_meta: Symbol,
+    remove_fact: RemoveFact,
 };
 
 pub const DecodeError = error{ BadIr, OutOfMemory };
@@ -98,7 +133,7 @@ pub const Decoder = struct {
         self.schemas.deinit(self.gpa);
     }
 
-    /// A diff payload is a JSON array of ops.
+    /// A genesis diff payload is a bare JSON array of ops.
     pub fn decodePayload(self: *Decoder, json: std.json.Value) DecodeError![]DiffOp {
         if (json != .array) return error.BadIr;
         const ops = try self.arena.alloc(DiffOp, json.array.items.len);
@@ -106,6 +141,18 @@ pub const Decoder = struct {
             ops[i] = try self.decodeOp(item);
         }
         return ops;
+    }
+
+    /// A proper diff object: `{name, layer?, by, via, ops:[…]}`.
+    pub fn decodeDiffObject(self: *Decoder, json: std.json.Value) DecodeError!Diff {
+        const obj = try object(json);
+        return .{
+            .name = try self.internSym(obj.get("name") orelse return error.BadIr),
+            .layer = try self.layerOf(obj),
+            .by = try self.internSym(obj.get("by") orelse return error.BadIr),
+            .via = try self.internSym(obj.get("via") orelse return error.BadIr),
+            .ops = try self.decodePayload(obj.get("ops") orelse return error.BadIr),
+        };
     }
 
     fn decodeOp(self: *Decoder, json: std.json.Value) DecodeError!DiffOp {
@@ -116,10 +163,52 @@ pub const Decoder = struct {
             return .{ .add_schema = schema };
         } else if (std.mem.eql(u8, kv.key, "add_rule")) {
             return .{ .add_rule = try self.decodeRule(kv.val) };
+        } else if (std.mem.eql(u8, kv.key, "add_meta")) {
+            return .{ .add_meta = try self.decodeMeta(kv.val) };
         } else if (std.mem.eql(u8, kv.key, "add_fact")) {
             return .{ .add_fact = try self.decodeFact(kv.val) };
+        } else if (std.mem.eql(u8, kv.key, "remove_schema")) {
+            return .{ .remove_schema = try self.internSym(kv.val) };
+        } else if (std.mem.eql(u8, kv.key, "remove_rule")) {
+            return .{ .remove_rule = try self.internSym(kv.val) };
+        } else if (std.mem.eql(u8, kv.key, "remove_meta")) {
+            return .{ .remove_meta = try self.internSym(kv.val) };
+        } else if (std.mem.eql(u8, kv.key, "remove_fact")) {
+            const obj = try object(kv.val);
+            const key_json = obj.get("key") orelse return error.BadIr;
+            if (key_json != .array) return error.BadIr;
+            const key = try self.arena.alloc(Value, key_json.array.items.len);
+            // Untyped decode: key values match rows by tag + payload, so a
+            // JSON key must use the same representation the schema stores.
+            for (key_json.array.items, 0..) |kj, i| {
+                key[i] = try self.decodeValue(kj);
+            }
+            return .{ .remove_fact = .{
+                .schema = try self.internSym(obj.get("schema") orelse return error.BadIr),
+                .key = key,
+            } };
         }
         return error.BadIr;
+    }
+
+    fn decodeMeta(self: *Decoder, json: std.json.Value) DecodeError!Meta {
+        const obj = try object(json);
+        const min: u32 = if (obj.get("min_staged_ticks")) |m| blk: {
+            if (m != .integer) return error.BadIr;
+            break :blk std.math.cast(u32, m.integer) orelse return error.BadIr;
+        } else 0;
+        return .{
+            .name = try self.internSym(obj.get("name") orelse return error.BadIr),
+            .layer = try self.layerOf(obj),
+            .governs_layer = try self.internSym(obj.get("governs") orelse return error.BadIr),
+            .min_staged_ticks = min,
+            .allow = try self.decodeExpr(obj.get("allow") orelse return error.BadIr),
+        };
+    }
+
+    fn layerOf(self: *Decoder, obj: std.json.ObjectMap) DecodeError!Symbol {
+        if (obj.get("layer")) |l| return self.internSym(l);
+        return self.interner.intern(self.gpa, "statute") catch error.OutOfMemory;
     }
 
     fn decodeSchema(self: *Decoder, json: std.json.Value) DecodeError!Schema {
@@ -140,7 +229,12 @@ pub const Decoder = struct {
             fields[i] = .{ .name = fname, .ty = ty };
         }
         if (key_json.integer < 1 or key_json.integer > fields.len) return error.BadIr;
-        return .{ .name = name, .fields = fields, .key_len = @intCast(key_json.integer) };
+        return .{
+            .name = name,
+            .fields = fields,
+            .key_len = @intCast(key_json.integer),
+            .layer = try self.layerOf(obj),
+        };
     }
 
     fn decodeRule(self: *Decoder, json: std.json.Value) DecodeError!Rule {
@@ -153,6 +247,7 @@ pub const Decoder = struct {
             .name = try self.internSym(obj.get("name") orelse return error.BadIr),
             .on = try self.internSym(obj.get("on") orelse return error.BadIr),
             .priority = priority,
+            .layer = try self.layerOf(obj),
             .when = try self.decodeExpr(obj.get("when") orelse return error.BadIr),
             .do = try self.decodeActions(obj.get("do") orelse return error.BadIr),
         };
@@ -222,6 +317,10 @@ pub const Decoder = struct {
                 .bind = try self.internSym(obj.get("bind") orelse return error.BadIr),
                 .body = try self.decodeActions(obj.get("do") orelse return error.BadIr),
             } };
+        } else if (std.mem.eql(u8, kv.key, "stage")) {
+            const diff = try self.arena.create(Diff);
+            diff.* = try self.decodeDiffObject(kv.val);
+            return .{ .stage = diff };
         }
         return error.BadIr;
     }
@@ -250,6 +349,18 @@ pub const Decoder = struct {
             } };
         } else if (std.mem.eql(u8, kv.key, "not")) {
             e.* = .{ .not = try self.decodeExpr(kv.val) };
+        } else if (std.mem.eql(u8, kv.key, "exists")) {
+            const obj = try object(kv.val);
+            const key_json = obj.get("key") orelse return error.BadIr;
+            if (key_json != .array) return error.BadIr;
+            const key = try self.arena.alloc(Expr, key_json.array.items.len);
+            for (key_json.array.items, 0..) |kj, i| {
+                key[i] = (try self.decodeExpr(kj)).*;
+            }
+            e.* = .{ .exists = .{
+                .schema = try self.internSym(obj.get("schema") orelse return error.BadIr),
+                .key = key,
+            } };
         } else {
             return error.BadIr;
         }
@@ -355,6 +466,41 @@ test "decodes schema, fact, and rule ops" {
     const body = rule.do[0].foreach.body;
     try std.testing.expectEqual(UpdateOp.add, body[0].update.op);
     try std.testing.expectEqual(BinOp.mul, body[0].update.value.bin.op);
+}
+
+test "decodes metas, removes, stage actions, and exists exprs" {
+    var t = TestSetup.init();
+    defer t.deinit();
+
+    const ops = try t.decode(
+        \\[
+        \\ {"add_schema":{"name":"office","fields":[["name","symbol"],["holder","symbol"]],"key":2,"layer":"organic"}},
+        \\ {"add_meta":{"name":"amend_statute","layer":"organic","governs":"statute","min_staged_ticks":2,
+        \\   "allow":{"exists":{"schema":"office","key":[{"lit":"tax_office"},{"field":["diff","by"]}]}}}},
+        \\ {"add_rule":{"name":"propose","on":"tick.quarter","when":{"lit":true},"do":[
+        \\   {"stage":{"name":"act","by":"baron","via":"decree","ops":[
+        \\     {"remove_schema":"office"},
+        \\     {"remove_fact":{"schema":"office","key":["tax_office","baron"]}}
+        \\   ]}}
+        \\ ]}}
+        \\]
+    );
+
+    const schema = ops[0].add_schema;
+    try std.testing.expectEqualStrings("organic", t.interner.lookup(schema.layer));
+
+    const meta = ops[1].add_meta;
+    try std.testing.expectEqual(@as(u32, 2), meta.min_staged_ticks);
+    try std.testing.expectEqual(schema.name, meta.allow.exists.schema);
+    try std.testing.expectEqual(@as(usize, 2), meta.allow.exists.key.len);
+
+    const rule = ops[2].add_rule;
+    // layer defaults to statute when omitted
+    try std.testing.expectEqualStrings("statute", t.interner.lookup(rule.layer));
+    const diff = rule.do[0].stage;
+    try std.testing.expectEqualStrings("baron", t.interner.lookup(diff.by));
+    try std.testing.expectEqual(schema.name, diff.ops[0].remove_schema);
+    try std.testing.expectEqual(@as(usize, 2), diff.ops[1].remove_fact.key.len);
 }
 
 test "rejects malformed IR" {

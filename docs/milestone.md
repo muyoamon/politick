@@ -59,7 +59,7 @@ is checked in (`src/golden_test.zig`) and reproduced on a fresh build and
 via the CLI; a rule that errors leaves no partial writes and raises
 `rule_failed` the same tick.
 
-## M2 — Diffs + meta (slice 2)
+## M2 — Diffs + meta (slice 2) ✅ (2026-07-06)
 
 The commit check — the heart of the system.
 
@@ -70,11 +70,14 @@ The commit check — the heart of the system.
   `facts_dropped` events, schema change = remove + add unless `migrate`).
 - Layers as data; `meta` terms governing diffs by layer.
 
-**Exit criteria:** property tests against adversarial diffs pass —
-L0-targeting diffs rejected, capability escalation rejected, a diff
-weakening its own governing meta rule rejected, dangling-reference diffs
-rejected with a dependency list; a valid statute commits atomically and
-the replay test still holds.
+**Exit criteria (met):** the adversarial suite (`src/commit_test.zig`)
+passes — L0-targeting diffs rejected, capability escalation rejected
+(office-fact `exists` check), a diff weakening its own governing meta rule
+rejected by the layer above, dangling-reference diffs rejected with a
+dependency list (and the revolutionary variant that carries its closure
+commits); a valid statute commits atomically (state-hash equality on
+reject), delay keeps diffs staged and fact-visible, and the replay tests
+hold with staging active.
 
 ## M3 — Procedures (slice 3)
 

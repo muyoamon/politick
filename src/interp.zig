@@ -43,6 +43,15 @@ pub const Ctx = struct {
     env_len: usize = 0,
     staged_updates: std.ArrayList(store_mod.QueuedUpdate) = .empty,
     staged_events: std.ArrayList(Event) = .empty,
+    staged_diffs: std.ArrayList(*const ir.Diff) = .empty,
+
+    /// Pre-bind a row var (kernel use: `diff` → staged_diff row when
+    /// evaluating meta allow expressions).
+    pub fn bind(self: *Ctx, name: Symbol, schema: Symbol, row: []const Value) void {
+        std.debug.assert(self.env_len < max_env_depth);
+        self.env[self.env_len] = .{ .name = name, .schema = schema, .row = row };
+        self.env_len += 1;
+    }
 };
 
 fn burn(ctx: *Ctx) EvalError!void {
@@ -69,6 +78,11 @@ pub fn eval(ctx: *Ctx, expr: *const ir.Expr) EvalError!Value {
             const v = try eval(ctx, inner);
             if (v != .boolean) return error.TypeMismatch;
             return .{ .boolean = !v.boolean };
+        },
+        .exists => |e| {
+            const key = try ctx.ta.alloc(Value, e.key.len);
+            for (e.key, 0..) |*k, i| key[i] = try eval(ctx, k);
+            return .{ .boolean = ctx.store.get(e.schema, key) != null };
         },
     }
 }
@@ -175,6 +189,9 @@ pub fn execActions(ctx: *Ctx, actions: []const ir.Action) EvalError!void {
                     try execActions(ctx, f.body);
                 }
             },
+            .stage => |diff| {
+                try ctx.staged_diffs.append(ctx.ta, diff);
+            },
         }
     }
 }
@@ -209,15 +226,16 @@ const TestRig = struct {
         rig.population = try rig.sym("population");
         rig.approval = try rig.sym("approval");
         rig.param = try rig.sym("param");
-        try rig.store.addSchema(a, .{ .name = rig.population, .key_len = 1, .fields = try a.dupe(ir.Field, &.{
+        const statute = try rig.sym("statute");
+        try rig.store.addSchema(a, .{ .name = rig.population, .key_len = 1, .layer = statute, .fields = try a.dupe(ir.Field, &.{
             .{ .name = try rig.sym("bloc"), .ty = .symbol },
             .{ .name = try rig.sym("count"), .ty = .int },
         }) });
-        try rig.store.addSchema(a, .{ .name = rig.approval, .key_len = 1, .fields = try a.dupe(ir.Field, &.{
+        try rig.store.addSchema(a, .{ .name = rig.approval, .key_len = 1, .layer = statute, .fields = try a.dupe(ir.Field, &.{
             .{ .name = try rig.sym("bloc"), .ty = .symbol },
             .{ .name = try rig.sym("value"), .ty = .float },
         }) });
-        try rig.store.addSchema(a, .{ .name = rig.param, .key_len = 1, .fields = try a.dupe(ir.Field, &.{
+        try rig.store.addSchema(a, .{ .name = rig.param, .key_len = 1, .layer = statute, .fields = try a.dupe(ir.Field, &.{
             .{ .name = try rig.sym("name"), .ty = .symbol },
             .{ .name = try rig.sym("value"), .ty = .float },
         }) });
@@ -305,6 +323,46 @@ test "foreach stages one update per row with increasing seq" {
     try testing.expectEqual(@as(usize, 0), rig.store.queued.items.len);
 }
 
+test "exists tests row presence with evaluated keys" {
+    var rig = try TestRig.init();
+    defer rig.deinit();
+    var c = rig.ctx(1000);
+
+    const north = lit(.{ .symbol = try rig.sym("north") });
+    const ghost = lit(.{ .symbol = try rig.sym("ghost") });
+    const has_north = ir.Expr{ .exists = .{ .schema = rig.population, .key = &.{north} } };
+    const has_ghost = ir.Expr{ .exists = .{ .schema = rig.population, .key = &.{ghost} } };
+
+    try testing.expectEqual(Value{ .boolean = true }, try eval(&c, &has_north));
+    try testing.expectEqual(Value{ .boolean = false }, try eval(&c, &has_ghost));
+}
+
+test "stage appends to staged_diffs, atomically with rule failure" {
+    var rig = try TestRig.init();
+    defer rig.deinit();
+    var c = rig.ctx(1000);
+
+    const diff = ir.Diff{
+        .name = try rig.sym("act"),
+        .layer = try rig.sym("statute"),
+        .by = try rig.sym("baron"),
+        .via = try rig.sym("decree"),
+        .ops = &.{},
+    };
+    const t = lit(.{ .boolean = true });
+    const stage = ir.Action{ .stage = &diff };
+    const rule = ir.Rule{ .name = diff.name, .on = try rig.sym("e"), .priority = 0, .layer = diff.layer, .when = &t, .do = &.{stage} };
+    try testing.expectEqual(true, try runRule(&c, &rule));
+    try testing.expectEqual(@as(usize, 1), c.staged_diffs.items.len);
+
+    // A failing rule leaves its staged diffs to be discarded with the ctx.
+    var failing = rig.ctx(10);
+    const boom = ir.Expr{ .bin = .{ .op = .div, .lhs = &t, .rhs = &t } };
+    const bad = ir.Rule{ .name = diff.name, .on = rule.on, .priority = 0, .layer = diff.layer, .when = &boom, .do = &.{stage} };
+    try testing.expectError(error.TypeMismatch, runRule(&failing, &bad));
+    try testing.expectEqual(@as(usize, 0), failing.staged_diffs.items.len);
+}
+
 test "fuel exhaustion errors and when:false does not fire" {
     var rig = try TestRig.init();
     defer rig.deinit();
@@ -314,11 +372,11 @@ test "fuel exhaustion errors and when:false does not fire" {
     const emit = ir.Action{ .emit = .{ .event = try rig.sym("ping"), .args = &.{} } };
 
     var starved = rig.ctx(1);
-    const rule = ir.Rule{ .name = try rig.sym("r"), .on = try rig.sym("e"), .priority = 0, .when = &t, .do = &.{ emit, emit } };
+    const rule = ir.Rule{ .name = try rig.sym("r"), .on = try rig.sym("e"), .priority = 0, .layer = try rig.sym("statute"), .when = &t, .do = &.{ emit, emit } };
     try testing.expectError(error.OutOfFuel, runRule(&starved, &rule));
 
     var fine = rig.ctx(1000);
-    const silent = ir.Rule{ .name = rule.name, .on = rule.on, .priority = 0, .when = &f, .do = &.{emit} };
+    const silent = ir.Rule{ .name = rule.name, .on = rule.on, .priority = 0, .layer = rule.layer, .when = &f, .do = &.{emit} };
     try testing.expectEqual(false, try runRule(&fine, &silent));
     try testing.expectEqual(@as(usize, 0), fine.staged_events.items.len);
 }

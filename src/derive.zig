@@ -26,7 +26,7 @@ test "totalPopulation sums the count field" {
 
     const population = try interner.intern(gpa, "population");
     const ir = @import("ir.zig");
-    try store.addSchema(a, .{ .name = population, .key_len = 1, .fields = try a.dupe(ir.Field, &.{
+    try store.addSchema(a, .{ .name = population, .key_len = 1, .layer = try interner.intern(gpa, "statute"), .fields = try a.dupe(ir.Field, &.{
         .{ .name = try interner.intern(gpa, "bloc"), .ty = .symbol },
         .{ .name = try interner.intern(gpa, "count"), .ty = .int },
     }) });

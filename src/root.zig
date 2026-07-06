@@ -10,9 +10,11 @@ pub const ir = @import("ir.zig");
 pub const store = @import("store.zig");
 pub const interp = @import("interp.zig");
 pub const derive = @import("derive.zig");
+pub const check = @import("check.zig");
 pub const tick = @import("tick.zig");
 
 test {
     std.testing.refAllDecls(@This());
     _ = @import("golden_test.zig");
+    _ = @import("commit_test.zig");
 }

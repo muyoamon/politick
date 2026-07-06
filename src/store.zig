@@ -67,6 +67,26 @@ pub const FactStore = struct {
         }
     }
 
+    /// COMMIT-only (§9 cascade). Returns the number of dropped rows for the
+    /// facts_dropped event. Removing an absent schema is a no-op returning 0
+    /// (callers validate existence beforehand).
+    pub fn removeSchema(self: *FactStore, name: Symbol) usize {
+        const table = self.tables.getPtr(name) orelse return 0;
+        const count = table.rows.items.len;
+        _ = self.tables.orderedRemove(name);
+        _ = self.schemas.orderedRemove(name);
+        return count;
+    }
+
+    /// COMMIT-only. Returns whether a row was removed.
+    pub fn removeFact(self: *FactStore, schema_sym: Symbol, key: []const Value) bool {
+        const schema = self.schemas.get(schema_sym) orelse return false;
+        const table = self.tables.getPtr(schema_sym) orelse return false;
+        const idx = findRowIndex(schema, table.rows.items, key) orelse return false;
+        _ = table.rows.orderedRemove(idx);
+        return true;
+    }
+
     pub fn get(self: *const FactStore, schema_sym: Symbol, key: []const Value) ?[]const Value {
         const schema = self.schemas.get(schema_sym) orelse return null;
         const table = self.tables.get(schema_sym) orelse return null;
@@ -122,8 +142,9 @@ pub const FactStore = struct {
         self.queued.clearRetainingCapacity();
     }
 
-    /// Canonical state hash: schemas in symbol order, rows in key order
-    /// (keys are unique, so this is a total order), length-prefixed.
+    /// Canonical state hash: schemas in symbol order — identity (layer,
+    /// key_len, fields) plus rows in key order (keys are unique, so this is
+    /// a total order), length-prefixed.
     pub fn feedStateHash(self: *const FactStore, scratch: std.mem.Allocator, hasher: *hash.StateHasher) error{OutOfMemory}!void {
         const schema_syms = try scratch.dupe(Symbol, self.schemas.keys());
         std.mem.sort(Symbol, schema_syms, {}, symbolLessThan);
@@ -132,6 +153,13 @@ pub const FactStore = struct {
             const schema = self.schemas.get(sym).?;
             const table = self.tables.get(sym).?;
             hasher.writeU32(sym.index());
+            hasher.writeU32(schema.layer.index());
+            hasher.writeU8(schema.key_len);
+            hasher.writeU64(schema.fields.len);
+            for (schema.fields) |f| {
+                hasher.writeU32(f.name.index());
+                hasher.writeU8(@intFromEnum(f.ty));
+            }
             hasher.writeU64(table.rows.items.len);
 
             const sorted = try scratch.dupe([]Value, table.rows.items);
@@ -143,7 +171,7 @@ pub const FactStore = struct {
     }
 };
 
-fn coerce(ty: ir.FieldType, v: Value) StoreError!Value {
+pub fn coerce(ty: ir.FieldType, v: Value) StoreError!Value {
     return switch (ty) {
         .int => if (v == .int) v else error.TypeMismatch,
         .float => switch (v) {
@@ -157,12 +185,17 @@ fn coerce(ty: ir.FieldType, v: Value) StoreError!Value {
 }
 
 fn findRow(schema: ir.Schema, table_rows: []const []Value, key: []const Value) ?[]Value {
+    const idx = findRowIndex(schema, table_rows, key) orelse return null;
+    return table_rows[idx];
+}
+
+fn findRowIndex(schema: ir.Schema, table_rows: []const []Value, key: []const Value) ?usize {
     if (key.len != schema.key_len) return null;
-    outer: for (table_rows) |row| {
+    outer: for (table_rows, 0..) |row, i| {
         for (key, row[0..schema.key_len]) |k, r| {
             if (!k.eql(r)) continue :outer;
         }
-        return row;
+        return i;
     }
     return null;
 }
@@ -216,10 +249,29 @@ const TestWorld = struct {
             .{ .name = try self.sym("value"), .ty = .float },
         });
         const name = try self.sym("approval");
-        try self.store.addSchema(a, .{ .name = name, .fields = fields, .key_len = 1 });
+        try self.store.addSchema(a, .{ .name = name, .fields = fields, .key_len = 1, .layer = try self.sym("statute") });
         return name;
     }
 };
+
+test "removeSchema drops rows, removeFact drops one row" {
+    var t = TestWorld.init();
+    defer t.deinit();
+    const a = t.arena.allocator();
+    const approval = try t.addApproval();
+    const north = try t.sym("north");
+    const south = try t.sym("south");
+    try t.store.insert(a, approval, &.{ .{ .symbol = north }, .{ .float = 0.6 } });
+    try t.store.insert(a, approval, &.{ .{ .symbol = south }, .{ .float = 0.5 } });
+
+    try testing.expect(t.store.removeFact(approval, &.{.{ .symbol = north }}));
+    try testing.expect(!t.store.removeFact(approval, &.{.{ .symbol = north }}));
+    try testing.expectEqual(@as(usize, 1), t.store.rows(approval).len);
+
+    try testing.expectEqual(@as(usize, 1), t.store.removeSchema(approval));
+    try testing.expectEqual(@as(?ir.Schema, null), t.store.schemas.get(approval));
+    try testing.expectEqual(@as(usize, 0), t.store.removeSchema(approval));
+}
 
 test "insert validates arity and type, upserts by key" {
     var t = TestWorld.init();
