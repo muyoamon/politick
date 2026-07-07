@@ -17,7 +17,7 @@ GRAMMAR_PATH = Path(__file__).parent / "grammar" / "diff.gbnf"
 
 
 def diff_grammar() -> str:
-    return GRAMMAR_PATH.read_text()
+    return GRAMMAR_PATH.read_text(encoding="utf-8")
 
 
 class Llm(Protocol):

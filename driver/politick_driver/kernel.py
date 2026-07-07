@@ -69,6 +69,7 @@ class Kernel:
             [str(self.binary), "--log", str(log_path), "--ticks", str(ticks), "--seed", str(self.seed), "--json"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
         )
         if proc.returncode != 0:
             raise KernelError(f"kernel run failed: {proc.stderr.strip() or proc.stdout.strip()}")
@@ -84,7 +85,7 @@ class Kernel:
 
     def check(self, log_path: Path, diff: dict) -> Verdict:
         """Static validation of a draft diff object against the log's world."""
-        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
             json.dump(diff, f)
             draft = Path(f.name)
         try:
@@ -92,6 +93,7 @@ class Kernel:
                 [str(self.binary), "check", "--log", str(log_path), "--diff", str(draft), "--seed", str(self.seed)],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
             )
         finally:
             draft.unlink()
@@ -115,6 +117,7 @@ class Kernel:
             [str(self.binary), "--log", str(log_path), "--ticks", str(ticks), "--seed", str(self.seed)],
             capture_output=True,
             text=True,
+            encoding="utf-8",
         )
         if proc.returncode != 0:
             raise KernelError(f"kernel replay failed: {proc.stderr.strip()}")

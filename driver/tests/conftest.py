@@ -21,5 +21,5 @@ def legislature_log(tmp_path) -> Path:
     from politick_driver import log as logmod
 
     path = tmp_path / "world.ndjson"
-    logmod.create_log(path, json.loads(LEGISLATURE.read_text()))
+    logmod.create_log(path, json.loads(LEGISLATURE.read_text(encoding="utf-8")))
     return path

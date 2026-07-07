@@ -39,11 +39,11 @@ def create_log(path: Path, genesis_ops: list[dict] | None = None) -> None:
     lines = [HEADER]
     if genesis_ops is not None:
         lines.append(dumps_entry(Entry(tick=0, seq=1, kind="diff", payload=genesis_ops)))
-    path.write_text("\n".join(lines) + "\n")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
 
 
 def read_log(path: Path) -> list[Entry]:
-    lines = [ln for ln in path.read_text().splitlines() if ln]
+    lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln]
     if not lines:
         raise ValueError(f"{path}: empty log (missing header)")
     header = json.loads(lines[0])
@@ -63,6 +63,6 @@ def next_seq(entries: list[Entry]) -> int:
 def append_entries(path: Path, entries: list[Entry]) -> None:
     if not entries:
         return
-    with path.open("a") as f:
+    with path.open("a", encoding="utf-8", newline="\n") as f:
         for e in entries:
             f.write(dumps_entry(e) + "\n")

@@ -85,7 +85,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if not args.log.exists():
-        genesis = json.loads(args.genesis.read_text()) if args.genesis else None
+        genesis = json.loads(args.genesis.read_text(encoding="utf-8")) if args.genesis else None
         logmod.create_log(args.log, genesis)
     kernel = Kernel(args.kernel, seed=args.seed)
 
@@ -95,7 +95,7 @@ def main(argv: list[str] | None = None) -> int:
         actors.append(
             LlmActor(
                 name=args.actor_name or args.persona,
-                persona=persona_file.read_text(),
+                persona=persona_file.read_text(encoding="utf-8"),
                 llm=LlamaServer(args.llm_url, seed=args.llm_seed, temperature=args.temperature),
                 kernel=kernel,
                 log_path=args.log,
