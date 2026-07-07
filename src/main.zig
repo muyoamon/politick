@@ -256,8 +256,26 @@ fn runCheck(
         try stdout.flush();
         std.process.exit(1);
     };
+    var ir_diag = politick.ir.Diag{};
+    decoder.diag = &ir_diag;
     const diff = decoder.decodeDiffObject(parsed) catch {
-        try stdout.writeAll("{\"ok\":false,\"reason\":\"bad_ir\"}\n");
+        try stdout.writeAll("{\"ok\":false,\"reason\":\"bad_ir\"");
+        if (ir_diag.code) |code| {
+            try stdout.writeAll(",\"diag\":{\"code\":");
+            try writeJsonString(stdout, code);
+            if (ir_diag.symbol) |s| {
+                try stdout.writeAll(",\"symbol\":");
+                try writeJsonString(stdout, world.interner.lookup(s));
+            }
+            if (ir_diag.field) |f| {
+                try stdout.writeAll(",\"field\":");
+                try writeJsonString(stdout, world.interner.lookup(f));
+            }
+            if (ir_diag.expected) |e| try stdout.print(",\"expected\":{d}", .{e});
+            if (ir_diag.got) |g| try stdout.print(",\"got\":{d}", .{g});
+            try stdout.writeByte('}');
+        }
+        try stdout.writeAll("}\n");
         try stdout.flush();
         std.process.exit(1);
     };
@@ -340,6 +358,22 @@ fn writeTickReport(
             }
             try w.writeAll("]}");
         }
+    }
+    // Currently-active rules (name, triggering event, layer) — so a persona
+    // can see what's already law, not just its effect on the facts, and
+    // avoid re-legislating the same thing every tick under a fresh name
+    // (or a colliding one, which COMMIT rejects as duplicate_term). Iteration
+    // order is world.rules' insertion order, i.e. legislative history order.
+    try w.writeAll("],\"rules\":[");
+    for (world.rules.items, 0..) |r, i| {
+        if (i > 0) try w.writeByte(',');
+        try w.writeAll("{\"name\":");
+        try writeJsonString(w, interner.lookup(r.name));
+        try w.writeAll(",\"on\":");
+        try writeJsonString(w, interner.lookup(r.on));
+        try w.writeAll(",\"layer\":");
+        try writeJsonString(w, interner.lookup(r.layer));
+        try w.writeAll("}");
     }
     // Full fact dump (kernel-layer schemas included: staged_diff rows are
     // pending legislation, proc_instance rows are procedure positions —

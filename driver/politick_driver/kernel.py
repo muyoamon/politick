@@ -23,6 +23,7 @@ class TickReport:
     events: list[dict]
     commits: list[dict]
     facts: dict[str, dict]
+    rules: list[dict]
 
     def rows(self, schema: str) -> list[list[Any]]:
         table = self.facts.get(schema)
@@ -50,6 +51,8 @@ class Verdict:
                 detail += f" on '{d['symbol']}'"
             if d.get("field"):
                 detail += f", field '{d['field']}'"
+            if d.get("expected") is not None and d.get("got") is not None:
+                detail += f" (expected {d['expected']} value(s), got {d['got']})"
             parts.append(f"detail: {detail}")
         return "; ".join(parts)
 
@@ -79,7 +82,7 @@ class Kernel:
                 continue
             obj = json.loads(line)
             reports.append(
-                TickReport(obj["tick"], obj["digest"], obj["events"], obj["commits"], obj["facts"])
+                TickReport(obj["tick"], obj["digest"], obj["events"], obj["commits"], obj["facts"], obj["rules"])
             )
         return reports
 

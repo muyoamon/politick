@@ -71,11 +71,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--persona", default="baron", help="persona file name under personas/ (without .md)")
     p.add_argument("--actor-name", default=None, help="actor id used as bill provenance (default: persona name)")
     p.add_argument("--quiet", action="store_true", help="suppress per-tick progress on stderr")
+    p.add_argument("--debug", action="store_true", help="log raw LLM draft text on rejection")
     args = p.parse_args(argv)
 
     # Progress goes to stderr so stdout stays parseable (commits + digest).
     logging.basicConfig(
-        level=logging.WARNING if args.quiet else logging.INFO,
+        level=logging.DEBUG if args.debug else (logging.WARNING if args.quiet else logging.INFO),
         format="%(message)s",
         stream=sys.stderr,
     )

@@ -82,7 +82,13 @@ class RandomActor:
 def summarize_world(report: TickReport) -> str:
     """Compact world-state view for the persona prompt: facts (including
     staged_diff = pending legislation and proc_instance = bills in
-    passage) plus this tick's events."""
+    passage), the currently active rules, plus this tick's events.
+
+    Rules are listed explicitly (not just their effect on the facts) so a
+    persona can tell "this is already law" from "this happens to be the
+    current value" — without it, nothing here carries across ticks, and an
+    actor with no memory of its own past bills will keep re-legislating the
+    same fix under a fresh name every tick."""
     lines = [f"tick: {report.tick}"]
     for schema, table in report.facts.items():
         if not table["rows"]:
@@ -90,6 +96,10 @@ def summarize_world(report: TickReport) -> str:
         header = ",".join(table["fields"])
         rows = "; ".join(",".join(map(_terse, r)) for r in table["rows"])
         lines.append(f"{schema}({header}): {rows}")
+    if report.rules:
+        rules = "; ".join(f"{r['name']}(on {r['on']})" for r in report.rules)
+        lines.append(f"active rules (already law — do not re-add one of these, or a "
+                      f"new rule with the same effect): {rules}")
     events = [e for e in report.events if not e["name"].startswith("tick.")]
     if events:
         lines.append("events: " + "; ".join(f"{e['name']}({', '.join(map(_terse, e['args']))})" for e in events))
@@ -116,6 +126,14 @@ Decide your move this turn. Reply with exactly one of:
 
 Do not draft any JSON yet."""
 
+COMPILE_EXAMPLE = (
+    '{"name":"wool_relief_act","by":"baron","via":"pass_statute","ops":[\n'
+    '  {"add_rule":{"name":"wool_relief","on":"tick.quarter","when":{"lit":true},"do":[\n'
+    '    {"update":{"schema":"param","key":[{"lit":"poll_tax_rate"}],"field":"value","op":"set","value":{"lit":0.05}}}\n'
+    '  ]}}\n'
+    ']}'
+)
+
 COMPILE_PROMPT = """Compile the bill below into a politick diff object.
 
 The world's schemas and current facts:
@@ -126,8 +144,17 @@ Bill intent:
 
 Rules for the diff object:
 - "name" is a fresh snake_case identifier for the act; "by" is "{name}"; "via" is "{procedure}".
-- "ops" holds the changes. Reference only schemas and fields that exist above (or that the diff itself adds).
-- Rules react to events ("on") and may update facts or emit events.
+- "ops" holds the changes. Reference only schemas and fields listed above (or ones the diff itself adds
+  via "add_schema") — there is no schema named "event"; events are not facts.
+- To change an existing fact (e.g. a param), prefer "add_rule" with an "update" action over
+  "remove_fact"/"add_fact" — it can't get a field count wrong the way a flattened "add_fact" can.
+- "add_fact" values, when you do use it, are a positional array matching the schema's fields in
+  order — one value per field, typed exactly (a "float" field takes a JSON number like 0.05, never
+  a quoted string; a "symbol" field takes a quoted string).
+
+Example — bill intent "lower the poll tax rate to 0.05":
+{example}
+
 Output only the JSON diff object."""
 
 RETRY_PROMPT = """The kernel rejected that draft: {feedback}
@@ -165,12 +192,13 @@ class LlmActor:
         log.info("[%s] tick %d: %s", self.name, tick, intent.splitlines()[0][:120])
 
         messages = [{"role": "user", "content": COMPILE_PROMPT.format(
-            world=world, intent=intent, name=self.name, procedure=self.procedure)}]
+            world=world, intent=intent, name=self.name, procedure=self.procedure, example=COMPILE_EXAMPLE)}]
         for attempt in range(1, self.max_retries + 1):
             # Compile wants precision, not creativity.
             draft_text = self.llm.chat(
                 self.persona, messages, grammar=diff_grammar(), temperature=0.2
             )
+            log.debug("[%s] tick %d: raw draft (attempt %d): %r", self.name, tick, attempt, draft_text)
             try:
                 bill = json.loads(draft_text)
             except json.JSONDecodeError:

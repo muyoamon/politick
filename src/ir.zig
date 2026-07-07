@@ -150,6 +150,25 @@ pub const DiffOp = union(enum) {
 
 pub const DecodeError = error{ BadIr, OutOfMemory };
 
+/// Structured detail for the first `BadIr` a decode call produced — recorded
+/// only when the caller attaches a `Diag` via `Decoder.diag` (default null,
+/// so existing callers see identical bare-`error.BadIr` behavior). Mirrors
+/// check.zig's `Ctx.diag`/`Diag` pattern: a `politick check` rejection during
+/// decode can now report *what* was wrong the same way a post-decode
+/// validation rejection already does, instead of a bare "bad_ir".
+pub const Diag = struct {
+    /// Short, stable code naming the failure kind, e.g. "missing_field",
+    /// "arity_mismatch", "unknown_schema", "bad_value_type", "unknown_op".
+    code: ?[]const u8 = null,
+    /// The primary offending symbol: a schema name, an unrecognized op/
+    /// expr/action tag, a missing or mistyped JSON key, or similar.
+    symbol: ?Symbol = null,
+    /// A secondary symbol, e.g. the field within `symbol`'s schema.
+    field: ?Symbol = null,
+    expected: ?u32 = null,
+    got: ?u32 = null,
+};
+
 /// Decodes diff payloads. Tracks schemas seen across payloads so `add_fact`
 /// values can be typed against schemas declared earlier in the same genesis
 /// sequence.
@@ -160,6 +179,8 @@ pub const Decoder = struct {
     gpa: std.mem.Allocator,
     interner: *intern.Interner,
     schemas: std.AutoArrayHashMapUnmanaged(Symbol, Schema) = .empty,
+    /// Optional out-slot for the first failure's structured detail.
+    diag: ?*Diag = null,
 
     pub fn init(arena: std.mem.Allocator, gpa: std.mem.Allocator, interner: *intern.Interner) Decoder {
         return .{ .arena = arena, .gpa = gpa, .interner = interner };
@@ -169,9 +190,40 @@ pub const Decoder = struct {
         self.schemas.deinit(self.gpa);
     }
 
+    /// Records `code`/context on the first failure only (later fails while
+    /// unwinding are noise) and returns `error.BadIr`.
+    fn fail(self: *Decoder, code: []const u8, opts: struct {
+        symbol: ?Symbol = null,
+        field: ?Symbol = null,
+        expected: ?u32 = null,
+        got: ?u32 = null,
+    }) DecodeError {
+        if (self.diag) |d| {
+            if (d.code == null) d.* = .{ .code = code, .symbol = opts.symbol, .field = opts.field, .expected = opts.expected, .got = opts.got };
+        }
+        return error.BadIr;
+    }
+
+    /// `obj.get(key) orelse return self.missingField(key)` — the single
+    /// most common failure shape in this decoder.
+    fn missingField(self: *Decoder, key: []const u8) DecodeError {
+        const sym = try self.internStr(key);
+        return self.fail("missing_field", .{ .field = sym });
+    }
+
+    /// A JSON value present under `key` but of the wrong shape/type.
+    fn badType(self: *Decoder, key: []const u8) DecodeError {
+        const sym = try self.internStr(key);
+        return self.fail("bad_type", .{ .field = sym });
+    }
+
+    fn internStr(self: *Decoder, s: []const u8) DecodeError!Symbol {
+        return self.interner.intern(self.gpa, s) catch error.OutOfMemory;
+    }
+
     /// A genesis diff payload is a bare JSON array of ops.
     pub fn decodePayload(self: *Decoder, json: std.json.Value) DecodeError![]DiffOp {
-        if (json != .array) return error.BadIr;
+        if (json != .array) return self.badType("ops");
         const ops = try self.arena.alloc(DiffOp, json.array.items.len);
         for (json.array.items, 0..) |item, i| {
             ops[i] = try self.decodeOp(item);
@@ -181,13 +233,13 @@ pub const Decoder = struct {
 
     /// A proper diff object: `{name, layer?, by, via, ops:[…]}`.
     pub fn decodeDiffObject(self: *Decoder, json: std.json.Value) DecodeError!Diff {
-        const obj = try object(json);
+        const obj = try self.object(json);
         return .{
-            .name = try self.internSym(obj.get("name") orelse return error.BadIr),
+            .name = try self.internSym(obj.get("name") orelse return self.missingField("name")),
             .layer = try self.layerOf(obj),
-            .by = try self.internSym(obj.get("by") orelse return error.BadIr),
-            .via = try self.internSym(obj.get("via") orelse return error.BadIr),
-            .ops = try self.decodePayload(obj.get("ops") orelse return error.BadIr),
+            .by = try self.internSym(obj.get("by") orelse return self.missingField("by")),
+            .via = try self.internSym(obj.get("via") orelse return self.missingField("via")),
+            .ops = try self.decodePayload(obj.get("ops") orelse return self.missingField("ops")),
         };
     }
 
@@ -195,12 +247,12 @@ pub const Decoder = struct {
     /// untyped literals. The kernel tick.* namespace is rejected, giving
     /// external actors exactly the powers of a rule's emit — no more.
     pub fn decodeEventObject(self: *Decoder, json: std.json.Value) DecodeError!ExternalEvent {
-        const obj = try object(json);
-        const name_json = obj.get("name") orelse return error.BadIr;
-        if (name_json != .string) return error.BadIr;
-        if (std.mem.startsWith(u8, name_json.string, "tick.")) return error.BadIr;
-        const args_json = obj.get("args") orelse return error.BadIr;
-        if (args_json != .array) return error.BadIr;
+        const obj = try self.object(json);
+        const name_json = obj.get("name") orelse return self.missingField("name");
+        if (name_json != .string) return self.badType("name");
+        if (std.mem.startsWith(u8, name_json.string, "tick.")) return self.fail("reserved_event_namespace", .{});
+        const args_json = obj.get("args") orelse return self.missingField("args");
+        if (args_json != .array) return self.badType("args");
         const args = try self.arena.alloc(Value, args_json.array.items.len);
         for (args_json.array.items, 0..) |aj, i| {
             args[i] = try self.decodeValue(aj);
@@ -211,17 +263,17 @@ pub const Decoder = struct {
     /// An external begin entry payload: `{procedure, bill:{…}}` — the same
     /// shape as the in-DSL begin action body.
     pub fn decodeBeginObject(self: *Decoder, json: std.json.Value) DecodeError!Action.Begin {
-        const obj = try object(json);
+        const obj = try self.object(json);
         const bill = try self.arena.create(Diff);
-        bill.* = try self.decodeDiffObject(obj.get("bill") orelse return error.BadIr);
+        bill.* = try self.decodeDiffObject(obj.get("bill") orelse return self.missingField("bill"));
         return .{
-            .procedure = try self.internSym(obj.get("procedure") orelse return error.BadIr),
+            .procedure = try self.internSym(obj.get("procedure") orelse return self.missingField("procedure")),
             .bill = bill,
         };
     }
 
     fn decodeOp(self: *Decoder, json: std.json.Value) DecodeError!DiffOp {
-        const kv = try singleKey(json);
+        const kv = try self.singleKey(json);
         if (std.mem.eql(u8, kv.key, "add_schema")) {
             const schema = try self.decodeSchema(kv.val);
             try self.schemas.put(self.gpa, schema.name, schema);
@@ -243,9 +295,9 @@ pub const Decoder = struct {
         } else if (std.mem.eql(u8, kv.key, "remove_procedure")) {
             return .{ .remove_procedure = try self.internSym(kv.val) };
         } else if (std.mem.eql(u8, kv.key, "remove_fact")) {
-            const obj = try object(kv.val);
-            const key_json = obj.get("key") orelse return error.BadIr;
-            if (key_json != .array) return error.BadIr;
+            const obj = try self.object(kv.val);
+            const key_json = obj.get("key") orelse return self.missingField("key");
+            if (key_json != .array) return self.badType("key");
             const key = try self.arena.alloc(Value, key_json.array.items.len);
             // Untyped decode: key values match rows by tag + payload, so a
             // JSON key must use the same representation the schema stores.
@@ -253,49 +305,49 @@ pub const Decoder = struct {
                 key[i] = try self.decodeValue(kj);
             }
             return .{ .remove_fact = .{
-                .schema = try self.internSym(obj.get("schema") orelse return error.BadIr),
+                .schema = try self.internSym(obj.get("schema") orelse return self.missingField("schema")),
                 .key = key,
             } };
         }
-        return error.BadIr;
+        return self.fail("unknown_op", .{ .symbol = try self.internStr(kv.key) });
     }
 
     fn decodeMeta(self: *Decoder, json: std.json.Value) DecodeError!Meta {
-        const obj = try object(json);
+        const obj = try self.object(json);
         const min: u32 = if (obj.get("min_staged_ticks")) |m| blk: {
-            if (m != .integer) return error.BadIr;
-            break :blk std.math.cast(u32, m.integer) orelse return error.BadIr;
+            if (m != .integer) return self.badType("min_staged_ticks");
+            break :blk std.math.cast(u32, m.integer) orelse return self.badType("min_staged_ticks");
         } else 0;
         return .{
-            .name = try self.internSym(obj.get("name") orelse return error.BadIr),
+            .name = try self.internSym(obj.get("name") orelse return self.missingField("name")),
             .layer = try self.layerOf(obj),
-            .governs_layer = try self.internSym(obj.get("governs") orelse return error.BadIr),
+            .governs_layer = try self.internSym(obj.get("governs") orelse return self.missingField("governs")),
             .min_staged_ticks = min,
-            .allow = try self.decodeExpr(obj.get("allow") orelse return error.BadIr),
+            .allow = try self.decodeExpr(obj.get("allow") orelse return self.missingField("allow")),
         };
     }
 
     fn decodeProcedure(self: *Decoder, json: std.json.Value) DecodeError!Procedure {
-        const obj = try object(json);
-        const steps_json = obj.get("steps") orelse return error.BadIr;
-        if (steps_json != .array) return error.BadIr;
+        const obj = try self.object(json);
+        const steps_json = obj.get("steps") orelse return self.missingField("steps");
+        if (steps_json != .array) return self.badType("steps");
         // Instances track their position by step name (re-resolve per step,
         // §8.1), so steps must be non-empty and uniquely named.
-        if (steps_json.array.items.len == 0) return error.BadIr;
+        if (steps_json.array.items.len == 0) return self.fail("empty_steps", .{});
         const steps = try self.arena.alloc(Step, steps_json.array.items.len);
         for (steps_json.array.items, 0..) |sj, i| {
-            const sobj = try object(sj);
+            const sobj = try self.object(sj);
             const step = Step{
-                .name = try self.internSym(sobj.get("name") orelse return error.BadIr),
-                .requires = try self.decodeExpr(sobj.get("requires") orelse return error.BadIr),
+                .name = try self.internSym(sobj.get("name") orelse return self.missingField("name")),
+                .requires = try self.decodeExpr(sobj.get("requires") orelse return self.missingField("requires")),
             };
             for (steps[0..i]) |prev| {
-                if (prev.name == step.name) return error.BadIr;
+                if (prev.name == step.name) return self.fail("duplicate_step", .{ .symbol = step.name });
             }
             steps[i] = step;
         }
         return .{
-            .name = try self.internSym(obj.get("name") orelse return error.BadIr),
+            .name = try self.internSym(obj.get("name") orelse return self.missingField("name")),
             .layer = try self.layerOf(obj),
             .steps = steps,
         };
@@ -307,23 +359,28 @@ pub const Decoder = struct {
     }
 
     fn decodeSchema(self: *Decoder, json: std.json.Value) DecodeError!Schema {
-        const obj = try object(json);
-        const name = try self.internSym(obj.get("name") orelse return error.BadIr);
-        const fields_json = obj.get("fields") orelse return error.BadIr;
-        if (fields_json != .array) return error.BadIr;
-        const key_json = obj.get("key") orelse return error.BadIr;
-        if (key_json != .integer) return error.BadIr;
+        const obj = try self.object(json);
+        const name = try self.internSym(obj.get("name") orelse return self.missingField("name"));
+        const fields_json = obj.get("fields") orelse return self.missingField("fields");
+        if (fields_json != .array) return self.badType("fields");
+        const key_json = obj.get("key") orelse return self.missingField("key");
+        if (key_json != .integer) return self.badType("key");
 
         const fields = try self.arena.alloc(Field, fields_json.array.items.len);
         for (fields_json.array.items, 0..) |fj, i| {
-            if (fj != .array or fj.array.items.len != 2) return error.BadIr;
+            if (fj != .array or fj.array.items.len != 2) return self.badType("fields");
             const fname = try self.internSym(fj.array.items[0]);
             const ftype_json = fj.array.items[1];
-            if (ftype_json != .string) return error.BadIr;
-            const ty = std.meta.stringToEnum(FieldType, ftype_json.string) orelse return error.BadIr;
+            if (ftype_json != .string) return self.badType("fields");
+            const ty = std.meta.stringToEnum(FieldType, ftype_json.string) orelse
+                return self.fail("unknown_field_type", .{ .symbol = name, .field = fname });
             fields[i] = .{ .name = fname, .ty = ty };
         }
-        if (key_json.integer < 1 or key_json.integer > fields.len) return error.BadIr;
+        if (key_json.integer < 1 or key_json.integer > fields.len) return self.fail("key_arity", .{
+            .symbol = name,
+            .expected = @intCast(fields.len),
+            .got = std.math.cast(u32, key_json.integer) orelse 0,
+        });
         return .{
             .name = name,
             .fields = fields,
@@ -333,38 +390,45 @@ pub const Decoder = struct {
     }
 
     fn decodeRule(self: *Decoder, json: std.json.Value) DecodeError!Rule {
-        const obj = try object(json);
+        const obj = try self.object(json);
         const priority: i32 = if (obj.get("priority")) |p| blk: {
-            if (p != .integer) return error.BadIr;
-            break :blk std.math.cast(i32, p.integer) orelse return error.BadIr;
+            if (p != .integer) return self.badType("priority");
+            break :blk std.math.cast(i32, p.integer) orelse return self.badType("priority");
         } else 0;
         return .{
-            .name = try self.internSym(obj.get("name") orelse return error.BadIr),
-            .on = try self.internSym(obj.get("on") orelse return error.BadIr),
+            .name = try self.internSym(obj.get("name") orelse return self.missingField("name")),
+            .on = try self.internSym(obj.get("on") orelse return self.missingField("on")),
             .priority = priority,
             .layer = try self.layerOf(obj),
-            .when = try self.decodeExpr(obj.get("when") orelse return error.BadIr),
-            .do = try self.decodeActions(obj.get("do") orelse return error.BadIr),
+            .when = try self.decodeExpr(obj.get("when") orelse return self.missingField("when")),
+            .do = try self.decodeActions(obj.get("do") orelse return self.missingField("do")),
         };
     }
 
     fn decodeFact(self: *Decoder, json: std.json.Value) DecodeError!AddFact {
-        const obj = try object(json);
-        const schema_sym = try self.internSym(obj.get("schema") orelse return error.BadIr);
-        const schema = self.schemas.get(schema_sym) orelse return error.BadIr;
-        const values_json = obj.get("values") orelse return error.BadIr;
-        if (values_json != .array) return error.BadIr;
-        if (values_json.array.items.len != schema.fields.len) return error.BadIr;
+        const obj = try self.object(json);
+        const schema_sym = try self.internSym(obj.get("schema") orelse return self.missingField("schema"));
+        const schema = self.schemas.get(schema_sym) orelse return self.fail("unknown_schema", .{ .symbol = schema_sym });
+        const values_json = obj.get("values") orelse return self.missingField("values");
+        if (values_json != .array) return self.badType("values");
+        if (values_json.array.items.len != schema.fields.len) return self.fail("arity_mismatch", .{
+            .symbol = schema_sym,
+            .expected = @intCast(schema.fields.len),
+            .got = @intCast(values_json.array.items.len),
+        });
 
         const values = try self.arena.alloc(Value, schema.fields.len);
         for (values_json.array.items, schema.fields, 0..) |vj, f, i| {
-            values[i] = try self.decodeTypedValue(f.ty, vj);
+            values[i] = self.decodeTypedValue(f.ty, vj) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.BadIr => return self.fail("bad_value_type", .{ .symbol = schema_sym, .field = f.name }),
+            };
         }
         return .{ .schema = schema_sym, .values = values };
     }
 
     fn decodeActions(self: *Decoder, json: std.json.Value) DecodeError![]Action {
-        if (json != .array) return error.BadIr;
+        if (json != .array) return self.badType("do");
         const actions = try self.arena.alloc(Action, json.array.items.len);
         for (json.array.items, 0..) |item, i| {
             actions[i] = try self.decodeAction(item);
@@ -373,15 +437,15 @@ pub const Decoder = struct {
     }
 
     fn decodeAction(self: *Decoder, json: std.json.Value) DecodeError!Action {
-        const kv = try singleKey(json);
-        const obj = try object(kv.val);
+        const kv = try self.singleKey(json);
+        const obj = try self.object(kv.val);
         if (std.mem.eql(u8, kv.key, "emit")) {
-            const event_json = obj.get("event") orelse return error.BadIr;
-            if (event_json != .string) return error.BadIr;
+            const event_json = obj.get("event") orelse return self.missingField("event");
+            if (event_json != .string) return self.badType("event");
             // The tick.* namespace is kernel-only; user rules may not forge it.
-            if (std.mem.startsWith(u8, event_json.string, "tick.")) return error.BadIr;
-            const args_json = obj.get("args") orelse return error.BadIr;
-            if (args_json != .array) return error.BadIr;
+            if (std.mem.startsWith(u8, event_json.string, "tick.")) return self.fail("reserved_event_namespace", .{});
+            const args_json = obj.get("args") orelse return self.missingField("args");
+            if (args_json != .array) return self.badType("args");
             const args = try self.arena.alloc(Expr, args_json.array.items.len);
             for (args_json.array.items, 0..) |aj, i| {
                 args[i] = (try self.decodeExpr(aj)).*;
@@ -391,26 +455,27 @@ pub const Decoder = struct {
                 .args = args,
             } };
         } else if (std.mem.eql(u8, kv.key, "update")) {
-            const op_json = obj.get("op") orelse return error.BadIr;
-            if (op_json != .string) return error.BadIr;
-            const key_json = obj.get("key") orelse return error.BadIr;
-            if (key_json != .array) return error.BadIr;
+            const op_json = obj.get("op") orelse return self.missingField("op");
+            if (op_json != .string) return self.badType("op");
+            const key_json = obj.get("key") orelse return self.missingField("key");
+            if (key_json != .array) return self.badType("key");
             const key = try self.arena.alloc(Expr, key_json.array.items.len);
             for (key_json.array.items, 0..) |kj, i| {
                 key[i] = (try self.decodeExpr(kj)).*;
             }
             return .{ .update = .{
-                .schema = try self.internSym(obj.get("schema") orelse return error.BadIr),
+                .schema = try self.internSym(obj.get("schema") orelse return self.missingField("schema")),
                 .key = key,
-                .field = try self.internSym(obj.get("field") orelse return error.BadIr),
-                .op = std.meta.stringToEnum(UpdateOp, op_json.string) orelse return error.BadIr,
-                .value = try self.decodeExpr(obj.get("value") orelse return error.BadIr),
+                .field = try self.internSym(obj.get("field") orelse return self.missingField("field")),
+                .op = std.meta.stringToEnum(UpdateOp, op_json.string) orelse
+                    return self.fail("unknown_update_op", .{ .symbol = try self.internStr(op_json.string) }),
+                .value = try self.decodeExpr(obj.get("value") orelse return self.missingField("value")),
             } };
         } else if (std.mem.eql(u8, kv.key, "foreach")) {
             return .{ .foreach = .{
-                .schema = try self.internSym(obj.get("schema") orelse return error.BadIr),
-                .bind = try self.internSym(obj.get("bind") orelse return error.BadIr),
-                .body = try self.decodeActions(obj.get("do") orelse return error.BadIr),
+                .schema = try self.internSym(obj.get("schema") orelse return self.missingField("schema")),
+                .bind = try self.internSym(obj.get("bind") orelse return self.missingField("bind")),
+                .body = try self.decodeActions(obj.get("do") orelse return self.missingField("do")),
             } };
         } else if (std.mem.eql(u8, kv.key, "stage")) {
             const diff = try self.arena.create(Diff);
@@ -419,16 +484,16 @@ pub const Decoder = struct {
         } else if (std.mem.eql(u8, kv.key, "begin")) {
             return .{ .begin = try self.decodeBeginObject(kv.val) };
         }
-        return error.BadIr;
+        return self.fail("unknown_action", .{ .symbol = try self.internStr(kv.key) });
     }
 
     fn decodeExpr(self: *Decoder, json: std.json.Value) DecodeError!*const Expr {
-        const kv = try singleKey(json);
+        const kv = try self.singleKey(json);
         const e = try self.arena.create(Expr);
         if (std.mem.eql(u8, kv.key, "lit")) {
             e.* = .{ .lit = try self.decodeValue(kv.val) };
         } else if (std.mem.eql(u8, kv.key, "field")) {
-            if (kv.val != .array or kv.val.array.items.len != 2) return error.BadIr;
+            if (kv.val != .array or kv.val.array.items.len != 2) return self.badType("field");
             e.* = .{ .field = .{
                 .row_var = try self.internSym(kv.val.array.items[0]),
                 .field_name = try self.internSym(kv.val.array.items[1]),
@@ -436,43 +501,44 @@ pub const Decoder = struct {
         } else if (std.mem.eql(u8, kv.key, "param")) {
             e.* = .{ .param = try self.internSym(kv.val) };
         } else if (std.mem.eql(u8, kv.key, "bin")) {
-            if (kv.val != .array or kv.val.array.items.len != 3) return error.BadIr;
+            if (kv.val != .array or kv.val.array.items.len != 3) return self.badType("bin");
             const op_json = kv.val.array.items[0];
-            if (op_json != .string) return error.BadIr;
+            if (op_json != .string) return self.badType("bin");
             e.* = .{ .bin = .{
-                .op = std.meta.stringToEnum(BinOp, op_json.string) orelse return error.BadIr,
+                .op = std.meta.stringToEnum(BinOp, op_json.string) orelse
+                    return self.fail("unknown_bin_op", .{ .symbol = try self.internStr(op_json.string) }),
                 .lhs = try self.decodeExpr(kv.val.array.items[1]),
                 .rhs = try self.decodeExpr(kv.val.array.items[2]),
             } };
         } else if (std.mem.eql(u8, kv.key, "not")) {
             e.* = .{ .not = try self.decodeExpr(kv.val) };
         } else if (std.mem.eql(u8, kv.key, "exists")) {
-            const obj = try object(kv.val);
-            const key_json = obj.get("key") orelse return error.BadIr;
-            if (key_json != .array) return error.BadIr;
+            const obj = try self.object(kv.val);
+            const key_json = obj.get("key") orelse return self.missingField("key");
+            if (key_json != .array) return self.badType("key");
             const key = try self.arena.alloc(Expr, key_json.array.items.len);
             for (key_json.array.items, 0..) |kj, i| {
                 key[i] = (try self.decodeExpr(kj)).*;
             }
             e.* = .{ .exists = .{
-                .schema = try self.internSym(obj.get("schema") orelse return error.BadIr),
+                .schema = try self.internSym(obj.get("schema") orelse return self.missingField("schema")),
                 .key = key,
             } };
         } else if (std.mem.eql(u8, kv.key, "lookup")) {
-            const obj = try object(kv.val);
-            const key_json = obj.get("key") orelse return error.BadIr;
-            if (key_json != .array) return error.BadIr;
+            const obj = try self.object(kv.val);
+            const key_json = obj.get("key") orelse return self.missingField("key");
+            if (key_json != .array) return self.badType("key");
             const key = try self.arena.alloc(Expr, key_json.array.items.len);
             for (key_json.array.items, 0..) |kj, i| {
                 key[i] = (try self.decodeExpr(kj)).*;
             }
             e.* = .{ .lookup = .{
-                .schema = try self.internSym(obj.get("schema") orelse return error.BadIr),
+                .schema = try self.internSym(obj.get("schema") orelse return self.missingField("schema")),
                 .key = key,
-                .field = try self.internSym(obj.get("field") orelse return error.BadIr),
+                .field = try self.internSym(obj.get("field") orelse return self.missingField("field")),
             } };
         } else {
-            return error.BadIr;
+            return self.fail("unknown_expr", .{ .symbol = try self.internStr(kv.key) });
         }
         return e;
     }
@@ -482,15 +548,17 @@ pub const Decoder = struct {
     fn decodeValue(self: *Decoder, json: std.json.Value) DecodeError!Value {
         return switch (json) {
             .integer => |v| .{ .int = v },
-            .float => |v| if (std.math.isNan(v)) error.BadIr else .{ .float = v },
+            .float => |v| if (std.math.isNan(v)) self.fail("nan_float", .{}) else .{ .float = v },
             .bool => |v| .{ .boolean = v },
             .string => .{ .symbol = try self.internSym(json) },
-            else => error.BadIr,
+            else => self.fail("bad_type", .{}),
         };
     }
 
     /// Fact values decode against the schema's field type; JSON integers
-    /// coerce to float fields.
+    /// coerce to float fields. Failures here carry no diag of their own —
+    /// `decodeFact` wraps this call and attaches the schema/field context,
+    /// since this function alone doesn't know either.
     fn decodeTypedValue(self: *Decoder, ty: FieldType, json: std.json.Value) DecodeError!Value {
         return switch (ty) {
             .int => if (json == .integer) .{ .int = json.integer } else error.BadIr,
@@ -505,23 +573,23 @@ pub const Decoder = struct {
     }
 
     fn internSym(self: *Decoder, json: std.json.Value) DecodeError!Symbol {
-        if (json != .string) return error.BadIr;
+        if (json != .string) return self.fail("bad_type", .{});
         return self.interner.intern(self.gpa, json.string) catch error.OutOfMemory;
+    }
+
+    fn singleKey(self: *Decoder, json: std.json.Value) DecodeError!KeyVal {
+        if (json != .object) return self.fail("bad_type", .{});
+        if (json.object.count() != 1) return self.fail("not_single_key", .{});
+        return .{ .key = json.object.keys()[0], .val = json.object.values()[0] };
+    }
+
+    fn object(self: *Decoder, json: std.json.Value) DecodeError!std.json.ObjectMap {
+        if (json != .object) return self.fail("bad_type", .{});
+        return json.object;
     }
 };
 
 const KeyVal = struct { key: []const u8, val: std.json.Value };
-
-fn singleKey(json: std.json.Value) DecodeError!KeyVal {
-    if (json != .object) return error.BadIr;
-    if (json.object.count() != 1) return error.BadIr;
-    return .{ .key = json.object.keys()[0], .val = json.object.values()[0] };
-}
-
-fn object(json: std.json.Value) DecodeError!std.json.ObjectMap {
-    if (json != .object) return error.BadIr;
-    return json.object;
-}
 
 const TestSetup = struct {
     arena: std.heap.ArenaAllocator,
@@ -540,6 +608,13 @@ const TestSetup = struct {
 
     fn decode(self: *TestSetup, source: []const u8) ![]DiffOp {
         self.decoder = Decoder.init(self.arena.allocator(), std.testing.allocator, &self.interner);
+        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, self.arena.allocator(), source, .{});
+        return self.decoder.decodePayload(parsed);
+    }
+
+    fn decodeWithDiag(self: *TestSetup, source: []const u8, diag: *Diag) ![]DiffOp {
+        self.decoder = Decoder.init(self.arena.allocator(), std.testing.allocator, &self.interner);
+        self.decoder.diag = diag;
         const parsed = try std.json.parseFromSliceLeaky(std.json.Value, self.arena.allocator(), source, .{});
         return self.decoder.decodePayload(parsed);
     }
@@ -625,6 +700,87 @@ test "rejects malformed IR" {
         var t = TestSetup.init();
         defer t.deinit();
         try std.testing.expectError(error.BadIr, t.decode(case));
+    }
+}
+
+test "decode failures attach structured diagnostics when a Diag is provided" {
+    // add_fact arity mismatch: the driver's actual failure mode — a model
+    // flattening field-name/value pairs into "values" instead of giving
+    // positional values matching the schema's field order.
+    {
+        var t = TestSetup.init();
+        defer t.deinit();
+        var diag = Diag{};
+        const source =
+            \\[
+            \\ {"add_schema":{"name":"param","fields":[["name","symbol"],["value","float"]],"key":1}},
+            \\ {"add_fact":{"schema":"param","values":["name","poll_tax_rate","value",0.05]}}
+            \\]
+        ;
+        try std.testing.expectError(error.BadIr, t.decodeWithDiag(source, &diag));
+        try std.testing.expectEqualStrings("arity_mismatch", diag.code.?);
+        try std.testing.expectEqualStrings("param", t.interner.lookup(diag.symbol.?));
+        try std.testing.expectEqual(@as(u32, 2), diag.expected.?);
+        try std.testing.expectEqual(@as(u32, 4), diag.got.?);
+    }
+
+    // add_fact against a schema that was never declared.
+    {
+        var t = TestSetup.init();
+        defer t.deinit();
+        var diag = Diag{};
+        try std.testing.expectError(error.BadIr, t.decodeWithDiag(
+            "[{\"add_fact\":{\"schema\":\"ghost\",\"values\":[]}}]",
+            &diag,
+        ));
+        try std.testing.expectEqualStrings("unknown_schema", diag.code.?);
+        try std.testing.expectEqualStrings("ghost", t.interner.lookup(diag.symbol.?));
+    }
+
+    // add_fact value typed wrong: a quoted "0.05" where the float field
+    // wants a JSON number — the other driver failure mode.
+    {
+        var t = TestSetup.init();
+        defer t.deinit();
+        var diag = Diag{};
+        const source =
+            \\[
+            \\ {"add_schema":{"name":"param","fields":[["name","symbol"],["value","float"]],"key":1}},
+            \\ {"add_fact":{"schema":"param","values":["poll_tax_rate","0.05"]}}
+            \\]
+        ;
+        try std.testing.expectError(error.BadIr, t.decodeWithDiag(source, &diag));
+        try std.testing.expectEqualStrings("bad_value_type", diag.code.?);
+        try std.testing.expectEqualStrings("param", t.interner.lookup(diag.symbol.?));
+        try std.testing.expectEqualStrings("value", t.interner.lookup(diag.field.?));
+    }
+
+    // Unrecognized op tag names the offending tag.
+    {
+        var t = TestSetup.init();
+        defer t.deinit();
+        var diag = Diag{};
+        try std.testing.expectError(error.BadIr, t.decodeWithDiag("[{\"bogus\":{}}]", &diag));
+        try std.testing.expectEqualStrings("unknown_op", diag.code.?);
+        try std.testing.expectEqualStrings("bogus", t.interner.lookup(diag.symbol.?));
+    }
+
+    // A missing required key names the key.
+    {
+        var t = TestSetup.init();
+        defer t.deinit();
+        var diag = Diag{};
+        const source = "[{\"add_rule\":{\"on\":\"e\",\"when\":{\"lit\":true},\"do\":[]}}]"; // no "name"
+        try std.testing.expectError(error.BadIr, t.decodeWithDiag(source, &diag));
+        try std.testing.expectEqualStrings("missing_field", diag.code.?);
+        try std.testing.expectEqualStrings("name", t.interner.lookup(diag.field.?));
+    }
+
+    // A caller that never attaches a Diag sees plain BadIr, unchanged.
+    {
+        var t = TestSetup.init();
+        defer t.deinit();
+        try std.testing.expectError(error.BadIr, t.decode("[{\"bogus\":{}}]"));
     }
 }
 
