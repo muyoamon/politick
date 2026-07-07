@@ -131,6 +131,10 @@ pub const Diff = struct {
     ops: []const DiffOp,
 };
 
+/// An external event from the log (driver input): literal args only, no
+/// expressions — drivers send values, not programs.
+pub const ExternalEvent = struct { name: Symbol, args: []const Value };
+
 pub const DiffOp = union(enum) {
     add_schema: Schema,
     add_rule: Rule,
@@ -184,6 +188,35 @@ pub const Decoder = struct {
             .by = try self.internSym(obj.get("by") orelse return error.BadIr),
             .via = try self.internSym(obj.get("via") orelse return error.BadIr),
             .ops = try self.decodePayload(obj.get("ops") orelse return error.BadIr),
+        };
+    }
+
+    /// An external event entry payload: `{name, args:[…]}`. Args are
+    /// untyped literals. The kernel tick.* namespace is rejected, giving
+    /// external actors exactly the powers of a rule's emit — no more.
+    pub fn decodeEventObject(self: *Decoder, json: std.json.Value) DecodeError!ExternalEvent {
+        const obj = try object(json);
+        const name_json = obj.get("name") orelse return error.BadIr;
+        if (name_json != .string) return error.BadIr;
+        if (std.mem.startsWith(u8, name_json.string, "tick.")) return error.BadIr;
+        const args_json = obj.get("args") orelse return error.BadIr;
+        if (args_json != .array) return error.BadIr;
+        const args = try self.arena.alloc(Value, args_json.array.items.len);
+        for (args_json.array.items, 0..) |aj, i| {
+            args[i] = try self.decodeValue(aj);
+        }
+        return .{ .name = try self.internSym(name_json), .args = args };
+    }
+
+    /// An external begin entry payload: `{procedure, bill:{…}}` — the same
+    /// shape as the in-DSL begin action body.
+    pub fn decodeBeginObject(self: *Decoder, json: std.json.Value) DecodeError!Action.Begin {
+        const obj = try object(json);
+        const bill = try self.arena.create(Diff);
+        bill.* = try self.decodeDiffObject(obj.get("bill") orelse return error.BadIr);
+        return .{
+            .procedure = try self.internSym(obj.get("procedure") orelse return error.BadIr),
+            .bill = bill,
         };
     }
 
@@ -384,12 +417,7 @@ pub const Decoder = struct {
             diff.* = try self.decodeDiffObject(kv.val);
             return .{ .stage = diff };
         } else if (std.mem.eql(u8, kv.key, "begin")) {
-            const bill = try self.arena.create(Diff);
-            bill.* = try self.decodeDiffObject(obj.get("bill") orelse return error.BadIr);
-            return .{ .begin = .{
-                .procedure = try self.internSym(obj.get("procedure") orelse return error.BadIr),
-                .bill = bill,
-            } };
+            return .{ .begin = try self.decodeBeginObject(kv.val) };
         }
         return error.BadIr;
     }

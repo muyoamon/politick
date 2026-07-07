@@ -75,9 +75,35 @@ const ProcInstance = struct {
     since_tick: u64,
 };
 
-const Rejection = struct { reason: Symbol, deps: []const Symbol = &.{} };
+pub const Rejection = struct { reason: Symbol, deps: []const Symbol = &.{} };
 
 const Verdict = union(enum) { commit, wait, reject: Rejection };
+
+/// Result of static diff validation (§9 passes 1–3). `ok` carries what
+/// COMMIT needs to finish judging: the layers the diff touches and the
+/// governing delay.
+pub const Validation = union(enum) {
+    ok: struct { touched_layers: []const Symbol, max_delay: u32 },
+    reject: Rejection,
+};
+
+/// Per-tick observability for the driver: what fired and what committed.
+/// Collection is passive — attaching a report never perturbs the tick.
+/// Recorded data is duplicated into `alloc` so it outlives the tick arena.
+pub const TickReport = struct {
+    alloc: std.mem.Allocator,
+    /// Every event processed in ACT, in delivery order (kernel ticks
+    /// included).
+    events: std.ArrayList(interp.Event) = .empty,
+    commits: std.ArrayList(CommitOutcome) = .empty,
+
+    pub const CommitOutcome = struct {
+        diff: Symbol,
+        committed: bool,
+        reason: ?Symbol = null,
+        deps: []const Symbol = &.{},
+    };
+};
 
 pub const World = struct {
     gpa: std.mem.Allocator,
@@ -94,8 +120,13 @@ pub const World = struct {
     rules_by_event: std.AutoArrayHashMapUnmanaged(Symbol, std.ArrayList(u32)) = .empty,
     staged: std.ArrayList(StagedDiff) = .empty,
     instances: std.ArrayList(ProcInstance) = .empty,
-    /// Kernel events raised outside ACT, delivered next tick.
+    /// Kernel events raised outside ACT — plus external events from the
+    /// log — delivered next tick, kernel-first then log order.
     pending: std.ArrayList(interp.Event) = .empty,
+    /// External begins from the log, consumed at the start of next ACT.
+    pending_begins: std.ArrayList(ir.Action.Begin) = .empty,
+    /// Optional observability sink for the current step() (CLI --json).
+    report: ?*TickReport = null,
     seq: u64 = 0,
     syms: KernelSyms,
 
@@ -277,6 +308,21 @@ pub const World = struct {
         return self.ir_arena.allocator();
     }
 
+    /// External log input (driver): deliver a user event in the next
+    /// step()'s ACT. Args are duplicated into the IR arena.
+    pub fn pendExternal(self: *World, name: Symbol, args: []const interp.Value) !void {
+        try self.pendKernel(name, args);
+    }
+
+    /// External log input: begin a procedure instance at the start of the
+    /// next step()'s ACT — the same semantics as a rule-fired begin action
+    /// (missing procedure ⇒ abort event; the forged_via guard applies since
+    /// external begins are not by_procedure). The bill must be decoded into
+    /// this world's IR arena.
+    pub fn beginExternal(self: *World, b: ir.Action.Begin) !void {
+        try self.pending_begins.append(self.ir_arena.allocator(), b);
+    }
+
     /// Run one tick; returns the new chain digest.
     pub fn step(self: *World) !hash.Digest {
         var arena = std.heap.ArenaAllocator.init(self.gpa);
@@ -322,6 +368,13 @@ pub const World = struct {
     }
 
     fn phaseAct(self: *World, ta: std.mem.Allocator) !void {
+        // External begins land first, so their instances see this tick's
+        // ADVANCE — identical timing to a begin fired by a rule in ACT.
+        for (self.pending_begins.items) |b| {
+            try self.beginInstance(b);
+        }
+        self.pending_begins.clearRetainingCapacity();
+
         var queue: std.ArrayList(interp.Event) = .empty;
         try queue.appendSlice(ta, self.pending.items);
         self.pending.clearRetainingCapacity();
@@ -335,6 +388,12 @@ pub const World = struct {
         var cursor: usize = 0;
         while (cursor < queue.items.len and cursor < max_events_per_tick) : (cursor += 1) {
             const event = queue.items[cursor];
+            if (self.report) |rep| {
+                try rep.events.append(rep.alloc, .{
+                    .name = event.name,
+                    .args = try rep.alloc.dupe(interp.Value, event.args),
+                });
+            }
             const subscribed = self.rules_by_event.get(event.name) orelse continue;
             for (subscribed.items) |rule_idx| {
                 try self.fireRule(ta, &self.rules.items[rule_idx], &queue);
@@ -553,6 +612,9 @@ pub const World = struct {
                 .commit => {
                     try self.applyOps(sd.diff.ops);
                     try self.pendKernel(self.syms.diff_committed, &.{.{ .symbol = sd.diff.name }});
+                    if (self.report) |rep| {
+                        try rep.commits.append(rep.alloc, .{ .diff = sd.diff.name, .committed = true });
+                    }
                 },
                 .reject => |r| {
                     var args: std.ArrayList(interp.Value) = .empty;
@@ -560,6 +622,14 @@ pub const World = struct {
                     try args.append(ta, .{ .symbol = r.reason });
                     for (r.deps) |d| try args.append(ta, .{ .symbol = d });
                     try self.pendKernel(self.syms.diff_rejected, args.items);
+                    if (self.report) |rep| {
+                        try rep.commits.append(rep.alloc, .{
+                            .diff = sd.diff.name,
+                            .committed = false,
+                            .reason = r.reason,
+                            .deps = try rep.alloc.dupe(Symbol, r.deps),
+                        });
+                    }
                 },
             }
             // Committed or rejected: unstage the diff and its fact.
@@ -573,16 +643,56 @@ pub const World = struct {
     /// delay → every governing meta allows.
     fn judge(self: *World, ta: std.mem.Allocator, sd: StagedDiff) !Verdict {
         const diff = sd.diff;
-        var touched_layers: std.ArrayList(Symbol) = .empty;
-        var removed_schemas: std.ArrayList(Symbol) = .empty;
-        var added_schemas: std.ArrayList(ir.Schema) = .empty;
-        var removed_procedures: std.ArrayList(Symbol) = .empty;
 
         // A diff whose `via` names a live procedure must actually have been
         // staged by that procedure's completion — otherwise any rule could
         // counterfeit the provenance that §2.5 metas gate on.
         if (!sd.by_procedure and self.findProcedure(diff.via) != null)
-            return .{ .reject = .{ .reason = self.syms.r_forged_via, .deps = &.{diff.via} } };
+            return .{ .reject = .{ .reason = self.syms.r_forged_via, .deps = try ta.dupe(Symbol, &.{diff.via}) } };
+
+        const ok = switch (try self.validateDiff(ta, diff, null)) {
+            .reject => |r| return .{ .reject = r },
+            .ok => |o| o,
+        };
+
+        // Delay = max over governing metas (§2.5).
+        if (self.tick - sd.since_tick < ok.max_delay) return .wait;
+
+        // Pass 4: every governing meta must allow, evaluated with the
+        // staged_diff fact row bound to `diff`.
+        const diff_row = self.store.get(self.syms.staged_diff, &.{.{ .symbol = diff.name }}).?;
+        for (self.metas.items) |m| {
+            if (!containsSym(ok.touched_layers, m.governs_layer)) continue;
+            var ictx = interp.Ctx{
+                .ta = ta,
+                .store = &self.store,
+                .param_schema = self.syms.param,
+                .fuel = fuel_budget,
+                .priority = 0,
+                .next_seq = &self.seq,
+            };
+            ictx.bind(self.syms.diff_var, self.syms.staged_diff, diff_row);
+            const allowed = interp.eval(&ictx, m.allow) catch
+                return .{ .reject = .{ .reason = self.syms.r_denied, .deps = try ta.dupe(Symbol, &.{m.name}) } };
+            if (allowed != .boolean or !allowed.boolean)
+                return .{ .reject = .{ .reason = self.syms.r_denied, .deps = try ta.dupe(Symbol, &.{m.name}) } };
+        }
+
+        return .commit;
+    }
+
+    /// Static validation of a draft or staged diff (§9 passes 1–3):
+    /// targets/L0/duplicates, reference closure + type checks against the
+    /// post-diff schema view, and governing-meta existence. Shared by
+    /// COMMIT and the CLI check subcommand. Rejection deps are allocated
+    /// in `ta`; `diag` (optional) records the first static-check failure.
+    /// Provenance (forged via), delay, and meta-allow evaluation are
+    /// COMMIT-only — a draft that passes here can still be voted down.
+    pub fn validateDiff(self: *World, ta: std.mem.Allocator, diff: *const ir.Diff, diag: ?*check.Diag) !Validation {
+        var touched_layers: std.ArrayList(Symbol) = .empty;
+        var removed_schemas: std.ArrayList(Symbol) = .empty;
+        var added_schemas: std.ArrayList(ir.Schema) = .empty;
+        var removed_procedures: std.ArrayList(Symbol) = .empty;
 
         // Pass 1: every op's target must exist (removes) or be new
         // (adds), must not touch layer "kernel", and contributes its
@@ -591,18 +701,18 @@ pub const World = struct {
             const layer: Symbol = switch (op) {
                 .add_schema => |s| blk: {
                     if (self.store.schemas.contains(s.name) and !containsSym(removed_schemas.items, s.name))
-                        return .{ .reject = .{ .reason = self.syms.r_duplicate, .deps = &.{s.name} } };
+                        return .{ .reject = .{ .reason = self.syms.r_duplicate, .deps = try ta.dupe(Symbol, &.{s.name}) } };
                     try added_schemas.append(ta, s);
                     break :blk s.layer;
                 },
                 .add_rule => |r| blk: {
                     if (self.findRule(r.name) != null)
-                        return .{ .reject = .{ .reason = self.syms.r_duplicate, .deps = &.{r.name} } };
+                        return .{ .reject = .{ .reason = self.syms.r_duplicate, .deps = try ta.dupe(Symbol, &.{r.name}) } };
                     break :blk r.layer;
                 },
                 .add_meta => |m| blk: {
                     if (self.findMeta(m.name) != null)
-                        return .{ .reject = .{ .reason = self.syms.r_duplicate, .deps = &.{m.name} } };
+                        return .{ .reject = .{ .reason = self.syms.r_duplicate, .deps = try ta.dupe(Symbol, &.{m.name}) } };
                     break :blk m.layer;
                 },
                 // Remove+add of the same name in one diff is replacement —
@@ -610,45 +720,45 @@ pub const World = struct {
                 // check honors this diff's own removes, like schemas do.
                 .add_procedure => |p| blk: {
                     if (self.findProcedure(p.name) != null and !containsSym(removed_procedures.items, p.name))
-                        return .{ .reject = .{ .reason = self.syms.r_duplicate, .deps = &.{p.name} } };
+                        return .{ .reject = .{ .reason = self.syms.r_duplicate, .deps = try ta.dupe(Symbol, &.{p.name}) } };
                     break :blk p.layer;
                 },
                 .remove_schema => |name| blk: {
                     const schema = self.store.schemas.get(name) orelse
-                        return .{ .reject = .{ .reason = self.syms.r_unknown_target, .deps = &.{name} } };
+                        return .{ .reject = .{ .reason = self.syms.r_unknown_target, .deps = try ta.dupe(Symbol, &.{name}) } };
                     try removed_schemas.append(ta, name);
                     break :blk schema.layer;
                 },
                 .remove_rule => |name| blk: {
                     const rule = self.findRule(name) orelse
-                        return .{ .reject = .{ .reason = self.syms.r_unknown_target, .deps = &.{name} } };
+                        return .{ .reject = .{ .reason = self.syms.r_unknown_target, .deps = try ta.dupe(Symbol, &.{name}) } };
                     break :blk rule.layer;
                 },
                 .remove_meta => |name| blk: {
                     const meta = self.findMeta(name) orelse
-                        return .{ .reject = .{ .reason = self.syms.r_unknown_target, .deps = &.{name} } };
+                        return .{ .reject = .{ .reason = self.syms.r_unknown_target, .deps = try ta.dupe(Symbol, &.{name}) } };
                     break :blk meta.layer;
                 },
                 .remove_procedure => |name| blk: {
                     const proc = self.findProcedure(name) orelse
-                        return .{ .reject = .{ .reason = self.syms.r_unknown_target, .deps = &.{name} } };
+                        return .{ .reject = .{ .reason = self.syms.r_unknown_target, .deps = try ta.dupe(Symbol, &.{name}) } };
                     try removed_procedures.append(ta, name);
                     break :blk proc.layer;
                 },
                 .add_fact => |f| blk: {
                     const schema = self.lookupSchemaIn(f.schema, added_schemas.items) orelse
-                        return .{ .reject = .{ .reason = self.syms.r_unknown_target, .deps = &.{f.schema} } };
+                        return .{ .reject = .{ .reason = self.syms.r_unknown_target, .deps = try ta.dupe(Symbol, &.{f.schema}) } };
                     if (f.values.len != schema.fields.len)
-                        return .{ .reject = .{ .reason = self.syms.r_bad_fact, .deps = &.{f.schema} } };
+                        return .{ .reject = .{ .reason = self.syms.r_bad_fact, .deps = try ta.dupe(Symbol, &.{f.schema}) } };
                     for (f.values, schema.fields) |v, fld| {
                         _ = store_mod.coerce(fld.ty, v) catch
-                            return .{ .reject = .{ .reason = self.syms.r_bad_fact, .deps = &.{f.schema} } };
+                            return .{ .reject = .{ .reason = self.syms.r_bad_fact, .deps = try ta.dupe(Symbol, &.{f.schema}) } };
                     }
                     break :blk schema.layer;
                 },
                 .remove_fact => |rf| blk: {
                     const schema = self.lookupSchemaIn(rf.schema, added_schemas.items) orelse
-                        return .{ .reject = .{ .reason = self.syms.r_unknown_target, .deps = &.{rf.schema} } };
+                        return .{ .reject = .{ .reason = self.syms.r_unknown_target, .deps = try ta.dupe(Symbol, &.{rf.schema}) } };
                     break :blk schema.layer;
                 },
             };
@@ -667,6 +777,7 @@ pub const World = struct {
             .view = view,
             .param_schema = self.syms.param,
             .prebound = &.{.{ .name = self.syms.diff_var, .schema = self.syms.staged_diff }},
+            .diag = diag,
         };
 
         if (removed_schemas.items.len > 0) {
@@ -699,14 +810,15 @@ pub const World = struct {
             .view = view,
             .param_schema = self.syms.param,
             .prebound = &.{.{ .name = self.syms.instance_var, .schema = self.syms.proc_instance }},
+            .diag = diag,
         };
         for (diff.ops) |op| switch (op) {
             .add_rule => |r| check.checkRule(&ctx, r) catch
-                return .{ .reject = .{ .reason = self.syms.r_dangling, .deps = &.{r.name} } },
+                return .{ .reject = .{ .reason = self.syms.r_dangling, .deps = try ta.dupe(Symbol, &.{r.name}) } },
             .add_meta => |m| check.checkMetaAllow(&ctx, m) catch
-                return .{ .reject = .{ .reason = self.syms.r_dangling, .deps = &.{m.name} } },
+                return .{ .reject = .{ .reason = self.syms.r_dangling, .deps = try ta.dupe(Symbol, &.{m.name}) } },
             .add_procedure => |p| check.checkProcedure(&proc_ctx, p) catch
-                return .{ .reject = .{ .reason = self.syms.r_dangling, .deps = &.{p.name} } },
+                return .{ .reject = .{ .reason = self.syms.r_dangling, .deps = try ta.dupe(Symbol, &.{p.name}) } },
             else => {},
         };
 
@@ -722,31 +834,10 @@ pub const World = struct {
                 }
             }
             if (!governed)
-                return .{ .reject = .{ .reason = self.syms.r_no_meta, .deps = &.{layer} } };
-        }
-        if (self.tick - sd.since_tick < max_delay) return .wait;
-
-        // Pass 4: every governing meta must allow, evaluated with the
-        // staged_diff fact row bound to `diff`.
-        const diff_row = self.store.get(self.syms.staged_diff, &.{.{ .symbol = diff.name }}).?;
-        for (self.metas.items) |m| {
-            if (!containsSym(touched_layers.items, m.governs_layer)) continue;
-            var ictx = interp.Ctx{
-                .ta = ta,
-                .store = &self.store,
-                .param_schema = self.syms.param,
-                .fuel = fuel_budget,
-                .priority = 0,
-                .next_seq = &self.seq,
-            };
-            ictx.bind(self.syms.diff_var, self.syms.staged_diff, diff_row);
-            const allowed = interp.eval(&ictx, m.allow) catch
-                return .{ .reject = .{ .reason = self.syms.r_denied, .deps = &.{m.name} } };
-            if (allowed != .boolean or !allowed.boolean)
-                return .{ .reject = .{ .reason = self.syms.r_denied, .deps = &.{m.name} } };
+                return .{ .reject = .{ .reason = self.syms.r_no_meta, .deps = try ta.dupe(Symbol, &.{layer}) } };
         }
 
-        return .commit;
+        return .{ .ok = .{ .touched_layers = touched_layers.items, .max_delay = max_delay } };
     }
 
     fn findRule(self: *const World, name: Symbol) ?*const ir.Rule {

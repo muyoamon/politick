@@ -8,7 +8,7 @@ const std = @import("std");
 
 pub const format_version: u32 = 1;
 
-pub const Kind = enum { event, diff };
+pub const Kind = enum { event, diff, begin };
 
 pub const Envelope = struct {
     tick: u64,

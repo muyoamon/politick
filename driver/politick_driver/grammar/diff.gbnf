@@ -1,0 +1,67 @@
+# GBNF grammar for the politick diff-object wire format (src/ir.zig
+# Decoder). Constrains llama.cpp sampling so the model cannot emit
+# anything the kernel decoder would reject syntactically — including the
+# genuinely recursive expression tree.
+#
+# Deliberately narrower than the full IR: bill rules may not contain
+# nested stage/begin actions (diffs-in-diffs are not persona business
+# yet), and semantic restrictions (e.g. emit may not forge tick.*) stay
+# with the kernel decoder + check subcommand.
+
+root ::= diff
+
+ws ::= [ \t\n]*
+
+string ::= "\"" char* "\""
+char ::= [^"\\\x00-\x1f] | "\\" (["\\/bfnrt] | "u" hex hex hex hex)
+hex ::= [0-9a-fA-F]
+int ::= "-"? ("0" | [1-9] [0-9]*)
+number ::= "-"? ("0" | [1-9] [0-9]*) ("." [0-9]+)? ([eE] [-+]? [0-9]+)?
+bool ::= "true" | "false"
+value ::= number | string | bool
+
+diff ::= "{" ws "\"name\":" ws string "," ws layerfield "\"by\":" ws string "," ws "\"via\":" ws string "," ws "\"ops\":" ws ops ws "}"
+layerfield ::= ("\"layer\":" ws string "," ws)?
+
+ops ::= "[" ws "]" | "[" ws op (ws "," ws op)* ws "]"
+op ::= addschema | addrule | addmeta | addprocedure | addfact | removeschema | removerule | removemeta | removeprocedure | removefact
+
+addschema ::= "{" ws "\"add_schema\":" ws "{" ws "\"name\":" ws string "," ws "\"fields\":" ws fields "," ws "\"key\":" ws int ("," ws "\"layer\":" ws string)? ws "}" ws "}"
+fields ::= "[" ws fielddef (ws "," ws fielddef)* ws "]"
+fielddef ::= "[" ws string "," ws fieldtype ws "]"
+fieldtype ::= "\"int\"" | "\"float\"" | "\"boolean\"" | "\"symbol\""
+
+addrule ::= "{" ws "\"add_rule\":" ws "{" ws "\"name\":" ws string "," ws "\"on\":" ws string "," ws ("\"priority\":" ws int "," ws)? ("\"layer\":" ws string "," ws)? "\"when\":" ws expr "," ws "\"do\":" ws actions ws "}" ws "}"
+
+addmeta ::= "{" ws "\"add_meta\":" ws "{" ws "\"name\":" ws string "," ws ("\"layer\":" ws string "," ws)? "\"governs\":" ws string "," ws ("\"min_staged_ticks\":" ws int "," ws)? "\"allow\":" ws expr ws "}" ws "}"
+
+addprocedure ::= "{" ws "\"add_procedure\":" ws "{" ws "\"name\":" ws string "," ws ("\"layer\":" ws string "," ws)? "\"steps\":" ws steps ws "}" ws "}"
+steps ::= "[" ws step (ws "," ws step)* ws "]"
+step ::= "{" ws "\"name\":" ws string "," ws "\"requires\":" ws expr ws "}"
+
+addfact ::= "{" ws "\"add_fact\":" ws "{" ws "\"schema\":" ws string "," ws "\"values\":" ws values ws "}" ws "}"
+values ::= "[" ws "]" | "[" ws value (ws "," ws value)* ws "]"
+
+removeschema ::= "{" ws "\"remove_schema\":" ws string ws "}"
+removerule ::= "{" ws "\"remove_rule\":" ws string ws "}"
+removemeta ::= "{" ws "\"remove_meta\":" ws string ws "}"
+removeprocedure ::= "{" ws "\"remove_procedure\":" ws string ws "}"
+removefact ::= "{" ws "\"remove_fact\":" ws "{" ws "\"schema\":" ws string "," ws "\"key\":" ws values ws "}" ws "}"
+
+actions ::= "[" ws "]" | "[" ws action (ws "," ws action)* ws "]"
+action ::= emit | update | foreach
+emit ::= "{" ws "\"emit\":" ws "{" ws "\"event\":" ws string "," ws "\"args\":" ws exprs ws "}" ws "}"
+update ::= "{" ws "\"update\":" ws "{" ws "\"schema\":" ws string "," ws "\"key\":" ws exprs "," ws "\"field\":" ws string "," ws "\"op\":" ws updop "," ws "\"value\":" ws expr ws "}" ws "}"
+updop ::= "\"set\"" | "\"add\""
+foreach ::= "{" ws "\"foreach\":" ws "{" ws "\"schema\":" ws string "," ws "\"bind\":" ws string "," ws "\"do\":" ws actions ws "}" ws "}"
+
+exprs ::= "[" ws "]" | "[" ws expr (ws "," ws expr)* ws "]"
+expr ::= lit | fieldref | paramref | binexpr | notexpr | existsexpr | lookupexpr
+lit ::= "{" ws "\"lit\":" ws value ws "}"
+fieldref ::= "{" ws "\"field\":" ws "[" ws string "," ws string ws "]" ws "}"
+paramref ::= "{" ws "\"param\":" ws string ws "}"
+binexpr ::= "{" ws "\"bin\":" ws "[" ws binop "," ws expr "," ws expr ws "]" ws "}"
+binop ::= "\"add\"" | "\"sub\"" | "\"mul\"" | "\"div\"" | "\"eq\"" | "\"lt\"" | "\"gt\"" | "\"and\"" | "\"or\""
+notexpr ::= "{" ws "\"not\":" ws expr ws "}"
+existsexpr ::= "{" ws "\"exists\":" ws "{" ws "\"schema\":" ws string "," ws "\"key\":" ws exprs ws "}" ws "}"
+lookupexpr ::= "{" ws "\"lookup\":" ws "{" ws "\"schema\":" ws string "," ws "\"key\":" ws exprs "," ws "\"field\":" ws string ws "}" ws "}"

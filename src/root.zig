@@ -18,4 +18,5 @@ test {
     _ = @import("golden_test.zig");
     _ = @import("commit_test.zig");
     _ = @import("procedure_test.zig");
+    _ = @import("external_test.zig");
 }

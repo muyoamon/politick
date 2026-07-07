@@ -112,17 +112,76 @@ step) mid-flight aborts with a kernel event; forged `via` is rejected; the
 two-world determinism test and the re-blessed golden digest hold, and the
 CLI replays byte-identically.
 
-## M4 — Persona driver (slice 4)
+## M4a — Externally drivable kernel (slice 4a) ✅ (2026-07-06)
 
-- Separate driver process (language TBD) speaking to the kernel only
-  through the log.
-- Bill compilation: natural-language bill → constrained decoding against
-  the IR schema → staged diff; validation rejections fed back for retry.
-- Scripted/random actors remain the test harness; LLM actors are opt-in.
+The kernel side of the driver contract: external input, machine-readable
+output, and draft validation — pure Zig, no LLM anywhere.
 
-**Exit criteria:** an LLM persona drafts a bill that passes validation and
-commits through `pass_statute`; kernel replay of the resulting log is
-byte-identical without the driver present.
+- Log protocol: new `begin` entry kind; tick-addressed externals. An
+  `event` entry at tick N is delivered in that tick's ACT (kernel-pended
+  events first, then log order); a `begin` entry starts a procedure
+  instance at the top of ACT — identical timing and semantics to a
+  rule-fired `begin`, `forged_via` guard included. `diff` entries stay
+  genesis-only (tick 0): bills enter through procedures so the meta rules
+  remain the sole gate.
+- `World.pendExternal` / `beginExternal`; the CLI fold groups entries by
+  tick and runs `max(--ticks, last entry tick)`.
+- `--json`: one deterministic NDJSON tick report per line — events
+  processed, commit verdicts (reason + deps), and a full fact dump
+  (kernel-layer `staged_diff` / `proc_instance` included — pending
+  legislation and procedure positions are exactly what personas need).
+  Report collection is passive; digests are unaffected.
+- `politick check --log … --diff bill.json`: static validation (§9
+  passes 1–3, factored out of COMMIT as `World.validateDiff`) of a draft
+  against the log's world, with structured diagnostics (`check.Diag`:
+  error code + offending symbol/field). Exit 0 ok / 1 rejected or
+  undecodable / 2 I/O. Delay and meta-allow evaluation stay COMMIT-only —
+  a draft that checks clean can still be voted down; that's the game.
+- Fixed latent dangling `deps` slices in the judge (stack temporaries now
+  duplicated into the tick arena — the `check` path made them observable).
+
+**Exit criteria (met):** `src/external_test.zig` — an external event
+fires at its tick and not before; an external `begin` carries
+`pass_statute` end to end from log entries alone; `validateDiff` verdicts
+match COMMIT reasons (L0, dangling with diagnostics, unknown target,
+default-deny) — and it *is* the COMMIT path, so parity is structural;
+attached reports never perturb digests; two-world determinism with
+externals interleaved; golden digest unchanged; CLI replay byte-identical.
+
+## M4b — Persona driver (slice 4b) ✅ (2026-07-06)
+
+Python driver (`driver/`, uv-managed) speaking to the kernel only through
+the log: appends `event`/`begin` entries, reads `--json` reports, one
+kernel invocation per tick (refold each time — O(T²), consistent with
+naive derive recompute). Local model instead of a hosted API.
+
+- `log.py` writes envelopes byte-compatible with `log.zig`; `kernel.py`
+  wraps run/check/replay as subprocesses.
+- Actors: `ScriptedActor` and seeded `RandomActor` remain the test
+  harness (kernel vs persona bugs stay distinguishable); `LlmActor` is
+  the M4 payoff.
+- LLM: llama.cpp `llama-server` via its OpenAI-compatible endpoint;
+  `grammar/diff.gbnf` constrains sampling to the diff-object wire format
+  with a genuinely recursive `expr` production (stronger than hosted
+  structured outputs, which can't express recursion). Two-turn persona
+  flow — free-text intent, then grammar-constrained compile — then a ≤3
+  retry loop feeding `politick check` diagnostics back (§8.3); the actor
+  abstains on exhaustion. Hosted APIs stay a config swap (any
+  OpenAI-compatible URL + depth-unrolled schema).
+- `worlds/legislature.json`: poll-tax economy + seats + `pass_statute`
+  (introduce/floor_vote/assent gated on generic facts, not per-bill rows)
+  + the via-checking `amend_statute` meta.
+- The CLI (`politick-driver`) re-verifies the exit criterion on every
+  run: after driving, it replays the log kernel-only and compares digests.
+
+**Exit criteria (met, CI-mocked):** the pytest suite drives
+introduce→vote→assent→commit end to end against the real kernel binary
+with a `FakeLlm`, including a draft that is rejected (unknown schema,
+diagnostics surfaced in the retry prompt) and fixed on retry; every
+driven log replays byte-identically without the driver. The live-model
+run is the same loop with a real endpoint:
+`llama-server -m <model.gguf>` then
+`cd driver && uv run politick-driver --ticks 20 --genesis worlds/legislature.json --llm-url http://127.0.0.1:8080`.
 
 ## Deferred (post-M4, unscheduled)
 
@@ -130,3 +189,5 @@ byte-identical without the driver present.
 - Priority as legislatable data (lex specialis / lex posterior, §8.2).
 - Surface syntax as a display/authoring layer.
 - Courts / `interpret` term kind (§7.4 — still an open design question).
+- Driver: multi-persona sessions, nested stage/begin in bill grammar,
+  a `--follow` kernel mode if the per-tick refold ever hurts.

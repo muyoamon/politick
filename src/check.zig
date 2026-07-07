@@ -36,13 +36,32 @@ pub const SchemaView = struct {
 
 pub const Binding = struct { name: Symbol, schema: Symbol };
 
+/// Diagnostic out-slot: on error, the failing code plus the offending
+/// symbol (schema or variable) and field land here, so rejections can be
+/// reported structurally (the driver retry loop needs to know *what*
+/// dangled, not just that something did).
+pub const Diag = struct {
+    err: ?CheckError = null,
+    symbol: ?Symbol = null,
+    field: ?Symbol = null,
+};
+
 pub const Ctx = struct {
     view: SchemaView,
     /// Interned "param" — what `param` expressions implicitly reference.
     param_schema: Symbol,
     /// Pre-bound row vars, e.g. `diff` → staged_diff for meta allow exprs.
     prebound: []const Binding = &.{},
+    /// Optional; records the first failure's specifics.
+    diag: ?*Diag = null,
 };
+
+fn fail(ctx: *const Ctx, err: CheckError, symbol: ?Symbol, field: ?Symbol) CheckError {
+    if (ctx.diag) |d| {
+        if (d.err == null) d.* = .{ .err = err, .symbol = symbol, .field = field };
+    }
+    return err;
+}
 
 const max_env_depth = 8;
 
@@ -93,12 +112,16 @@ fn checkExpr(ctx: *const Ctx, env: *Env, expr: *const ir.Expr) CheckError!void {
     switch (expr.*) {
         .lit => {},
         .field => |f| {
-            const schema_sym = env.lookup(f.row_var) orelse return error.UnboundVar;
-            const schema = ctx.view.get(schema_sym) orelse return error.UnknownSchema;
-            if (schema.fieldIndex(f.field_name) == null) return error.UnknownField;
+            const schema_sym = env.lookup(f.row_var) orelse
+                return fail(ctx, error.UnboundVar, f.row_var, f.field_name);
+            const schema = ctx.view.get(schema_sym) orelse
+                return fail(ctx, error.UnknownSchema, schema_sym, null);
+            if (schema.fieldIndex(f.field_name) == null)
+                return fail(ctx, error.UnknownField, schema_sym, f.field_name);
         },
         .param => {
-            if (ctx.view.get(ctx.param_schema) == null) return error.UnknownSchema;
+            if (ctx.view.get(ctx.param_schema) == null)
+                return fail(ctx, error.UnknownSchema, ctx.param_schema, null);
         },
         .bin => |b| {
             try checkExpr(ctx, env, b.lhs);
@@ -106,14 +129,19 @@ fn checkExpr(ctx: *const Ctx, env: *Env, expr: *const ir.Expr) CheckError!void {
         },
         .not => |inner| try checkExpr(ctx, env, inner),
         .exists => |e| {
-            const schema = ctx.view.get(e.schema) orelse return error.UnknownSchema;
-            if (e.key.len != schema.key_len) return error.ArityMismatch;
+            const schema = ctx.view.get(e.schema) orelse
+                return fail(ctx, error.UnknownSchema, e.schema, null);
+            if (e.key.len != schema.key_len)
+                return fail(ctx, error.ArityMismatch, e.schema, null);
             for (e.key) |*k| try checkExpr(ctx, env, k);
         },
         .lookup => |l| {
-            const schema = ctx.view.get(l.schema) orelse return error.UnknownSchema;
-            if (l.key.len != schema.key_len) return error.ArityMismatch;
-            if (schema.fieldIndex(l.field) == null) return error.UnknownField;
+            const schema = ctx.view.get(l.schema) orelse
+                return fail(ctx, error.UnknownSchema, l.schema, null);
+            if (l.key.len != schema.key_len)
+                return fail(ctx, error.ArityMismatch, l.schema, null);
+            if (schema.fieldIndex(l.field) == null)
+                return fail(ctx, error.UnknownField, l.schema, l.field);
             for (l.key) |*k| try checkExpr(ctx, env, k);
         },
     }
@@ -124,15 +152,20 @@ fn checkActions(ctx: *const Ctx, env: *Env, actions: []const ir.Action) CheckErr
         switch (action) {
             .emit => |e| for (e.args) |*arg| try checkExpr(ctx, env, arg),
             .update => |u| {
-                const schema = ctx.view.get(u.schema) orelse return error.UnknownSchema;
-                if (u.key.len != schema.key_len) return error.ArityMismatch;
-                const fi = schema.fieldIndex(u.field) orelse return error.UnknownField;
-                if (fi < schema.key_len) return error.KeyFieldUpdate;
+                const schema = ctx.view.get(u.schema) orelse
+                    return fail(ctx, error.UnknownSchema, u.schema, null);
+                if (u.key.len != schema.key_len)
+                    return fail(ctx, error.ArityMismatch, u.schema, null);
+                const fi = schema.fieldIndex(u.field) orelse
+                    return fail(ctx, error.UnknownField, u.schema, u.field);
+                if (fi < schema.key_len)
+                    return fail(ctx, error.KeyFieldUpdate, u.schema, u.field);
                 for (u.key) |*k| try checkExpr(ctx, env, k);
                 try checkExpr(ctx, env, u.value);
             },
             .foreach => |f| {
-                if (ctx.view.get(f.schema) == null) return error.UnknownSchema;
+                if (ctx.view.get(f.schema) == null)
+                    return fail(ctx, error.UnknownSchema, f.schema, null);
                 if (env.len == max_env_depth) return error.OutOfMemory;
                 env.stack[env.len] = .{ .name = f.bind, .schema = f.schema };
                 env.len += 1;
